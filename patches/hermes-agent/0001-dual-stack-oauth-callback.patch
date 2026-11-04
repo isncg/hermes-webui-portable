@@ -1,0 +1,138 @@
+diff --git a/hermes_cli/auth_codex_browser.py b/hermes_cli/auth_codex_browser.py
+index 399ba11fa7..405a47da5c 100644
+--- a/hermes_cli/auth_codex_browser.py
++++ b/hermes_cli/auth_codex_browser.py
+@@ -41,8 +41,9 @@ CODEX_LOGIN_FLOWS = ("device_code", "browser")
+ CODEX_BROWSER_PORT_BUSY_CODE = "codex_browser_port_busy"
+ 
+ _PORT_BUSY_NOTICE = (
+-    f"Port {CODEX_BROWSER_CALLBACK_PORT} is already in use (a Codex CLI sign-in may be running). "
+-    "OpenAI only redirects to that port, so falling back to the device-code login.")
++    f"Port {CODEX_BROWSER_CALLBACK_PORT} is already in use (another sign-in may still be waiting). "
++    "OpenAI only redirects to that port, so falling back to the device-code login. "
++    "Close the old login window and rerun this command to use the browser flow again.")
+ 
+ 
+ def _codex_login_flow(args: Any) -> str:
+@@ -141,6 +142,7 @@ def _codex_browser_login(
+               else "Could not open the browser automatically; use the URL above.")
+     wait = float(timeout_seconds or CODEX_BROWSER_CALLBACK_TIMEOUT_SECONDS)
+     print(f"Waiting for the OpenAI callback on {redirect_uri} (timeout {int(wait)}s, Ctrl+C to cancel)...")
++    print("If the browser reports a connection error, press Ctrl+C and rerun with --device-code.")
+     try:
+         callback = _serve_loopback_callback(
+             server, result, timeout_seconds=wait, err=_codex_err, timeout_code="codex_browser_callback_timeout")
+diff --git a/hermes_cli/auth_device_flow.py b/hermes_cli/auth_device_flow.py
+index 1627970912..b2ae76210c 100644
+--- a/hermes_cli/auth_device_flow.py
++++ b/hermes_cli/auth_device_flow.py
+@@ -10,6 +10,7 @@ import base64
+ import hashlib
+ import logging
+ import os
++import socket
+ import ssl
+ import sys
+ import threading
+@@ -146,15 +147,89 @@ def _make_loopback_callback_handler(
+     return _LoopbackCallbackHandler, result
+ 
+ 
++class _LoopbackServerGroup:
++    """Serve one handler on both IPv4 and IPv6 loopback sockets sharing a port."""
++
++    def __init__(self, servers: list[HTTPServer]) -> None:
++        self._servers = servers
++        self.server_address = servers[0].server_address
++
++    def serve_forever(self, poll_interval: float = 0.5) -> None:
++        for server in self._servers[1:]:
++            threading.Thread(
++                target=server.serve_forever,
++                kwargs={"poll_interval": poll_interval},
++                daemon=True,
++            ).start()
++        self._servers[0].serve_forever(poll_interval=poll_interval)
++
++    def shutdown(self) -> None:
++        for server in self._servers:
++            server.shutdown()
++
++    def server_close(self) -> None:
++        for server in self._servers:
++            server.server_close()
++
++
++def _localhost_resolves_to_ipv6() -> bool:
++    """Whether ``localhost`` may resolve to ::1 for the browser (true on Windows)."""
++    try:
++        infos = socket.getaddrinfo("localhost", None, type=socket.SOCK_STREAM)
++    except OSError:
++        return False
++    return any(info[0] == socket.AF_INET6 for info in infos)
++
++
+ def _bind_loopback_callback_server(
+     host: str, port: int, handler_cls: type[BaseHTTPRequestHandler], *, err: Callable[..., AuthError],
+     bind_failed_code: str,
+-) -> HTTPServer:
++) -> Any:
+     """Bind the loopback listener up front (``port=0`` = OS-assigned) so the redirect URI sent to
+-    the authorization server names a port we already own — no probe-close-rebind race."""
++    the authorization server names a port we already own, with no probe-close-rebind race.
++
++    ``localhost`` may resolve to ``::1`` before ``127.0.0.1`` on Windows, while the browser only
++    gets one chance to follow the redirect. Bind both loopback families on the same port so the
++    callback works regardless of which address the browser picked.
++    """
+ 
+     class _ReuseHTTPServer(HTTPServer):
+-        allow_reuse_address = True
++        # Windows treats SO_REUSEADDR as "bind anyway": a second process can
++        # claim the same loopback port, the kernel keeps delivering the OAuth
++        # callback to the first (possibly stale) listener, and the new login
++        # then waits until its timeout. Own the port exclusively there so a
++        # live listener becomes a clean "port busy" error instead.
++        allow_reuse_address = os.name != "nt"
++
++        def server_bind(self) -> None:
++            exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
++            if os.name == "nt" and exclusive is not None:
++                self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
++            super().server_bind()
++
++    class _IPv6HTTPServer(_ReuseHTTPServer):
++        address_family = socket.AF_INET6
++
++        def server_bind(self) -> None:
++            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
++            super().server_bind()
++
++    if host in {"127.0.0.1", "localhost"}:
++        try:
++            ipv4 = _ReuseHTTPServer(("127.0.0.1", port), handler_cls)
++        except OSError as exc:
++            raise err(f"Could not bind callback server on {host}:{port}: {exc}", bind_failed_code) from exc
++        actual_port = ipv4.server_address[1]
++        try:
++            ipv6 = _IPv6HTTPServer(("::1", actual_port), handler_cls)
++        except OSError as exc:
++            ipv4.server_close()
++            if _localhost_resolves_to_ipv6():
++                raise err(
++                    f"Could not bind the IPv6 loopback callback on [::1]:{actual_port}: {exc}",
++                    bind_failed_code) from exc
++            return ipv4
++        return _LoopbackServerGroup([ipv4, ipv6])
+ 
+     try:
+         return _ReuseHTTPServer((host, port), handler_cls)
+@@ -163,7 +238,7 @@ def _bind_loopback_callback_server(
+ 
+ 
+ def _serve_loopback_callback(
+-    server: HTTPServer, result: dict[str, Any], *, timeout_seconds: float, err: Callable[..., AuthError],
++    server: Any, result: dict[str, Any], *, timeout_seconds: float, err: Callable[..., AuthError],
+     timeout_code: str,
+ ) -> dict[str, Any]:
+     """Serve *server* until the redirect lands in *result* or the deadline passes; always closes."""

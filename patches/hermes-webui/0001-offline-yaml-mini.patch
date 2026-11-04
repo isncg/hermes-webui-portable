@@ -1,0 +1,1404 @@
+diff --git a/api/yaml_compat.py b/api/yaml_compat.py
+index acc0ce8..d8f606a 100644
+--- a/api/yaml_compat.py
++++ b/api/yaml_compat.py
+@@ -3,6 +3,10 @@
+ Hermes Agent's managed dependency environment ships ruamel.yaml only, so WebUI code
+ imports YAML through this module instead of assuming PyYAML is installed.
+ 
++A third, dependency-free backend (``api.yaml_mini``) exists for checkouts on a host that
++cannot reach a package index: it is selected only when HERMES_WEBUI_YAML_MINI is truthy and
++neither PyYAML nor ruamel.yaml imports, so the default failure contract stays unchanged.
++
+ The ruamel fallback reproduces PyYAML's behaviour, because the files it reads were
+ written by PyYAML (and by the Agent's ``hermes_yaml``, which is also YAML 1.1):
+ 
+@@ -19,15 +23,33 @@ written by PyYAML (and by the Agent's ``hermes_yaml``, which is also YAML 1.1):
+ from __future__ import annotations
+ 
+ import io
++import os
+ import re
+ 
++def _mini_backend_enabled() -> bool:
++    """True when an offline checkout opts into the dependency-free YAML fallback."""
++    return os.environ.get("HERMES_WEBUI_YAML_MINI", "").strip().lower() in ("1", "true", "yes", "on")
++
++
++_mini = None
++
+ try:
+     import yaml as _pyyaml
+ except ImportError:
+     _pyyaml = None
+-    import ruamel.yaml  # noqa: F401  (neither backend -> ImportError, as a bare ``import yaml`` would)
+-
+-BACKEND = "pyyaml" if _pyyaml is not None else "ruamel"
++    try:
++        import ruamel.yaml  # noqa: F401
++        _ruamel_available = True
++    except ImportError:
++        _ruamel_available = False
++        if _mini_backend_enabled():
++            # Offline opt-in (HERMES_WEBUI_YAML_MINI=1): stdlib-only fallback backend.
++            from api import yaml_mini as _mini
++        else:
++            raise  # neither backend -> ImportError, as a bare ``import yaml`` would (#7875)
++
++BACKEND = ("pyyaml" if _pyyaml is not None
++           else "ruamel" if _ruamel_available else "mini")
+ 
+ _YAML11 = (1, 1)
+ 
+@@ -165,6 +187,8 @@ def _ruamel(*, default_flow_style=False, allow_unicode=True, sort_keys=True, ind
+ def safe_load(stream):
+     if _pyyaml is not None:
+         return _pyyaml.safe_load(stream)
++    if BACKEND == "mini":
++        return _mini.safe_load(stream)
+     from ruamel.yaml import YAML
+ 
+     y = YAML(typ="safe", pure=True)
+@@ -193,6 +217,10 @@ def safe_dump(data, stream=None, *, default_flow_style=False, allow_unicode=Fals
+             data, stream, default_flow_style=default_flow_style, allow_unicode=allow_unicode,
+             sort_keys=sort_keys, indent=indent, width=width,
+         )
++    if BACKEND == "mini":
++        return _mini.safe_dump(data, stream, default_flow_style=default_flow_style,
++                               allow_unicode=allow_unicode, sort_keys=sort_keys,
++                               indent=indent, width=width)
+     return _ruamel_dump(data, stream, default_flow_style=default_flow_style,
+                         allow_unicode=allow_unicode, sort_keys=sort_keys, width=width)
+ 
+@@ -209,5 +237,9 @@ def dump(data, stream=None, *, default_flow_style=False, allow_unicode=False,
+             data, stream, default_flow_style=default_flow_style, allow_unicode=allow_unicode,
+             sort_keys=sort_keys, indent=indent, width=width,
+         )
++    if BACKEND == "mini":
++        return _mini.safe_dump(data, stream, default_flow_style=default_flow_style,
++                               allow_unicode=allow_unicode, sort_keys=sort_keys,
++                               indent=indent, width=width)
+     return _ruamel_dump(data, stream, default_flow_style=default_flow_style,
+                         allow_unicode=allow_unicode, sort_keys=sort_keys, width=width)
+diff --git a/api/yaml_mini.py b/api/yaml_mini.py
+new file mode 100644
+index 0000000..e555eab
+--- /dev/null
++++ b/api/yaml_mini.py
+@@ -0,0 +1,1019 @@
++"""Dependency-free YAML 1.1 subset: the opt-in last-resort backend for api.yaml_compat.
++
++Why this module exists. Hermes WebUI needs a YAML parser for config.yaml, profiles and
++workspaces.json-adjacent state, and api/yaml_compat.py only knows two backends: PyYAML
++and ruamel.yaml. On a host with no package index reachable (air-gapped box, restricted
++sandbox, a fresh venv before pip works) NEITHER can be installed, and ``import server``
++dies in api/profiles.py before the first request. That makes a source checkout
++impossible to deploy. This module keeps such a checkout bootable with the standard
++library alone.
++
++It is opt-in (HERMES_WEBUI_YAML_MINI=1, see yaml_compat.py) so that a checkout which is
++missing its dependencies still fails the way upstream expects: bare ``import yaml``
++semantics, i.e. ImportError. Install PyYAML (or ruamel.yaml) and unset the flag and this
++file stops being imported -- the backend order stays pyyaml > ruamel > mini.
++
++Scope, and how it fails. It implements the block-style subset that PyYAML itself writes
++for Hermes configs: nested mappings, block and flow sequences, flow collections,
++plain/single/double quoted scalars, literal and folded block scalars, comments, document
++markers, and PyYAML's YAML 1.1 implicit typing (on/off/yes/no are booleans, bare y/n stay
++strings, 010 is octal, 1e3 stays a string, dates are datetime.date, duplicate keys keep
++the last value).
++
++Anchors, aliases, merge keys (<<), tags (!!str), explicit keys (?), directives (%YAML),
++and multi-document streams are NOT implemented. Those raise UnsupportedYAMLError rather
++than being guessed at: every WebUI load site treats a parse failure as "empty config", so
++a silently wrong parse would let the next save truncate a user's config.yaml. Parse
++faithfully or fail loudly -- that is the whole rule here.
++"""
++
++from __future__ import annotations
++
++import datetime
++import math
++import re
++
++BACKEND = "mini"
++
++
++class MiniYAMLError(Exception):
++    """The document could not be parsed faithfully."""
++
++
++class UnsupportedYAMLError(MiniYAMLError):
++    """The document needs YAML features this module deliberately does not implement."""
++
++
++class RepresenterError(MiniYAMLError):
++    """A Python value cannot be emitted as YAML."""
++
++
++# -- implicit typing: copied from PyYAML's yaml/resolver.py (YAML 1.1 tables) --
++_BOOL_RE = re.compile(
++    r"^(?:yes|Yes|YES|no|No|NO|true|True|TRUE|false|False|FALSE|on|On|ON|off|Off|OFF)$")
++_INT_RE = re.compile(
++    r"^(?:[-+]?0b[0-1_]+|[-+]?0[0-7_]+|[-+]?(?:0|[1-9][0-9_]*)"
++    r"|[-+]?0x[0-9a-fA-F_]+|[-+]?[1-9][0-9_]*(?::[0-5]?[0-9])+)$")
++_FLOAT_RE = re.compile(
++    r"^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+][0-9]+)?"
++    r"|\.[0-9][0-9_]*(?:[eE][-+][0-9]+)?"
++    r"|[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*"
++    r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$")
++_TIMESTAMP_DATE_RE = re.compile(r"^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$")
++_TIMESTAMPT_RE = re.compile(
++    r"^[0-9][0-9][0-9][0-9]-[0-9][0-9]?-[0-9][0-9]?(?:[Tt]|[ \t]+)[0-9][0-9]?:[0-9][0-9]"
++    r":[0-9][0-9](?:\.[0-9]*)?(?:[ \t]*(?:Z|[-+][0-9][0-9]?(?::[0-9][0-9])?))?$")
++
++
++def _is_timestamp(text):
++    return bool(_TIMESTAMP_DATE_RE.match(text) or _TIMESTAMPT_RE.match(text))
++
++
++_TIMESTAMP_PARTS = re.compile(
++    r"^([0-9]{4})-([0-9]{1,2})-([0-9]{1,2})(?:(?:[Tt]|[ \t]+)([0-9]{1,2}):([0-9]{2})"
++    r":([0-9]{2})(?:\.([0-9]*))?(?:[ \t]*(Z|([-+])([0-9]{1,2})(?::([0-9]{2}))?)?)?)?$")
++
++_NULL_WORDS = ("", "~", "null", "Null", "NULL")
++
++
++def _construct_int(text):
++    value = text.replace("_", "")
++    sign = -1 if value[0] == "-" else 1
++    if value[0] in "+-":
++        value = value[1:]
++    if value.startswith("0b"):
++        return sign * int(value[2:], 2)
++    if value.startswith("0x"):
++        return sign * int(value[2:], 16)
++    if ":" in value:
++        total = 0
++        for part in value.split(":"):
++            total = total * 60 + int(part)
++        return sign * total
++    if value.startswith("0") and len(value) > 1:
++        return sign * int(value, 8)
++    return sign * int(value)
++
++
++def _construct_float(text):
++    value = text.replace("_", "")
++    sign = -1 if value[0] == "-" else 1
++    if value[0] in "+-":
++        value = value[1:]
++    lowered = value.lower()
++    if lowered == ".inf":
++        return math.inf if sign > 0 else -math.inf
++    if lowered == ".nan":
++        return math.nan
++    if ":" in value:
++        total = 0.0
++        for part in value.split(":"):
++            total = total * 60 + float(part)
++        return sign * total
++    return sign * float(value)
++
++
++def _construct_timestamp(text):
++    match = _TIMESTAMP_PARTS.match(text)
++    if match is None:
++        return text
++    year, month, day, hour, minute, second, frac, zone, tz_sign, tz_hour, tz_minute = match.groups()
++    if hour is None:
++        return datetime.date(int(year), int(month), int(day))
++    micro = 0
++    if frac:
++        micro = int((frac + "000000")[:6])
++    stamp = datetime.datetime(int(year), int(month), int(day),
++                              int(hour), int(minute), int(second), micro)
++    if zone == "Z":
++        return stamp.replace(tzinfo=datetime.timezone.utc)
++    if tz_sign:
++        delta = datetime.timedelta(hours=int(tz_hour or 0), minutes=int(tz_minute or 0))
++        if tz_sign == "-":
++            delta = -delta
++        return stamp.replace(tzinfo=datetime.timezone(delta))
++    return stamp
++
++
++def _resolve_plain(text):
++    """PyYAML SafeLoader resolution for an unquoted scalar."""
++    if text in _NULL_WORDS:
++        return None
++    if _BOOL_RE.match(text):
++        return text.lower() in ("yes", "true", "on")
++    if _INT_RE.match(text):
++        return _construct_int(text)
++    if _FLOAT_RE.match(text):
++        return _construct_float(text)
++    if _is_timestamp(text):
++        return _construct_timestamp(text)
++    return text
++
++
++# -- lexical helpers -----------------------------------------------------------
++_DOUBLE_ESCAPES = {
++    "0": "\x00", "a": "\x07", "b": "\x08", "t": "\t", "\t": "\t", "n": "\n",
++    "v": "\x0b", "f": "\x0c", "r": "\r", "e": "\x1b", " ": " ", '"': '"',
++    "/": "/", "\\": "\\", "N": "\x85", "_": "\xa0", "L": "\u2028", "P": "\u3029",
++}
++
++
++def _strip_comment(text):
++    """Drop a trailing ``# ...`` comment from a scalar line (outside quotes)."""
++    quote = None
++    index = 0
++    length = len(text)
++    while index < length:
++        char = text[index]
++        if quote:
++            if char == "\\" and quote == '"':
++                index += 2
++                continue
++            if char == quote:
++                if quote == "'" and text[index + 1:index + 2] == "'":
++                    index += 1
++                else:
++                    quote = None
++            index += 1
++            continue
++        if char in ("'", '"'):
++            quote = char
++        elif char == "#" and (index == 0 or text[index - 1] in " \t"):
++            return text[:index].rstrip()
++        index += 1
++    return text.rstrip()
++
++
++def _is_seq_entry(body):
++    return body == "-" or (body[:1] == "-" and body[1:2] in (" ", "\t"))
++
++
++def _split_key(body):
++    """Return (key_text, rest) when ``body`` opens a mapping entry, else None."""
++    if body.startswith("? "):
++        raise UnsupportedYAMLError("explicit mapping keys ('? ') are not supported")
++    depth = 0
++    quote = None
++    index = 0
++    length = len(body)
++    while index < length:
++        char = body[index]
++        if quote:
++            if char == "\\" and quote == '"':
++                index += 2
++                continue
++            if char == quote:
++                if quote == "'" and body[index + 1:index + 2] == "'":
++                    index += 1
++                else:
++                    quote = None
++            index += 1
++            continue
++        if char in ("'", '"'):
++            quote = char
++        elif char in "[{":
++            depth += 1
++        elif char in "]}":
++            depth -= 1
++        elif char == "#" and (index == 0 or body[index - 1] in " \t"):
++            break
++        elif char == ":" and depth == 0:
++            follower = body[index + 1:index + 2]
++            if follower in ("", " ", "\t"):
++                return body[:index].rstrip(), body[index + 1:].strip()
++        index += 1
++    return None
++
++
++def _scan_quoted(text, start):
++    """Walk a quoted scalar from the opening quote. Return (end_index, closed)."""
++    quote = text[start]
++    index = start + 1
++    length = len(text)
++    while index < length:
++        char = text[index]
++        if quote == '"':
++            if char == "\\":
++                index += 2
++                continue
++            if char == '"':
++                return index, True
++        else:
++            if char == "'":
++                if text[index + 1:index + 2] == "'":
++                    index += 2
++                    continue
++                return index, True
++        index += 1
++    return length, False
++
++
++def _unquote(text):
++    """Decode a complete quoted scalar (single line, quotes included)."""
++    if len(text) < 2 or text[0] != text[-1]:
++        raise MiniYAMLError("malformed quoted scalar: %r" % (text,))
++    body = text[1:-1]
++    if text[0] == "'":
++        return body.replace("''", "'")
++    out = []
++    index = 0
++    length = len(body)
++    while index < length:
++        char = body[index]
++        if char != "\\":
++            out.append(char)
++            index += 1
++            continue
++        index += 1
++        if index >= length:
++            raise MiniYAMLError("trailing backslash in double-quoted scalar")
++        marker = body[index]
++        if marker in ("x", "u", "U"):
++            digits = {"x": 2, "u": 4, "U": 8}[marker]
++            raw = body[index + 1:index + 1 + digits]
++            if len(raw) != digits:
++                raise MiniYAMLError("truncated \\%s escape in double-quoted scalar" % marker)
++            out.append(chr(int(raw, 16)))
++            index += 1 + digits
++            continue
++        if marker == "\n":
++            while index < length and body[index] in " \t\n":
++                index += 1
++            continue
++        if marker not in _DOUBLE_ESCAPES:
++            raise MiniYAMLError("unknown escape '\\%s' in double-quoted scalar" % marker)
++        out.append(_DOUBLE_ESCAPES[marker])
++        index += 1
++    return "".join(out)
++
++
++def _flow_state(text):
++    """Return (bracket_depth, open_quote_char_or_None) for a flow fragment."""
++    depth = 0
++    quote = None
++    index = 0
++    length = len(text)
++    while index < length:
++        char = text[index]
++        if quote:
++            if char == "\\" and quote == '"':
++                index += 2
++                continue
++            if char == quote:
++                if quote == "'" and text[index + 1:index + 2] == "'":
++                    index += 1
++                else:
++                    quote = None
++            index += 1
++            continue
++        if char in ("'", '"'):
++            quote = char
++        elif char in "[{":
++            depth += 1
++        elif char in "]}":
++            depth -= 1
++        index += 1
++    return depth, quote
++
++
++def _skip_space(text, index):
++    while index < len(text) and text[index] in " \t":
++        index += 1
++    return index
++
++
++def _flow_scalar(text, index):
++    """Read a quoted or plain scalar inside a flow collection."""
++    index = _skip_space(text, index)
++    if index >= len(text):
++        raise MiniYAMLError("unexpected end of flow collection")
++    char = text[index]
++    if char in ("'", '"'):
++        end, closed = _scan_quoted(text, index)
++        if not closed:
++            raise MiniYAMLError("unterminated quoted scalar in flow collection")
++        return _unquote(text[index:end + 1]), end + 1
++    if char in "&*!":
++        raise UnsupportedYAMLError("anchors, aliases and tags in flow collections "
++                                   "are not supported by the built-in YAML fallback")
++    start = index
++    while index < len(text) and text[index] not in ",]}":
++        if text[index] == ":" and text[index + 1:index + 2] in ("", " ", "\t"):
++            break
++        index += 1
++    return _resolve_plain(text[start:index].strip()), index
++
++
++def _flow_node(text, index):
++    """Parse one flow value (scalar, [..], {..}) starting at index."""
++    index = _skip_space(text, index)
++    if index >= len(text):
++        raise MiniYAMLError("unexpected end of flow collection")
++    char = text[index]
++    if char == "[":
++        items = []
++        index += 1
++        while True:
++            index = _skip_space(text, index)
++            if index >= len(text):
++                raise MiniYAMLError("unterminated flow sequence")
++            if text[index] == "]":
++                return items, index + 1
++            value, index = _flow_node(text, index)
++            items.append(value)
++            index = _skip_space(text, index)
++            if index < len(text) and text[index] == ",":
++                index += 1
++                continue
++            if index < len(text) and text[index] == "]":
++                return items, index + 1
++            raise MiniYAMLError("expected ',' or ']' in flow sequence")
++    if char == "{":
++        mapping = {}
++        index += 1
++        while True:
++            index = _skip_space(text, index)
++            if index >= len(text):
++                raise MiniYAMLError("unterminated flow mapping")
++            if text[index] == "}":
++                return mapping, index + 1
++            key, index = _flow_scalar(text, index)
++            index = _skip_space(text, index)
++            value = None
++            if index < len(text) and text[index] == ":":
++                value, index = _flow_node(text, index + 1)
++            if not isinstance(key, (str, int, float, bool, datetime.date, datetime.datetime)) \
++                    and key is not None:
++                raise UnsupportedYAMLError("complex mapping keys are not supported")
++            mapping[key] = value
++            index = _skip_space(text, index)
++            if index < len(text) and text[index] == ",":
++                index += 1
++                continue
++            if index < len(text) and text[index] == "}":
++                return mapping, index + 1
++            raise MiniYAMLError("expected ',' or '}' in flow mapping")
++    return _flow_scalar(text, index)
++
++
++# -- block parser --------------------------------------------------------------
++class _Reader:
++    """Indentation-driven parser for the block-style YAML subset."""
++
++    def __init__(self, text):
++        self.raw = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
++        if self.raw and self.raw[-1] == "":
++            # The final newline terminates the last line; it is not a blank line.
++            self.raw.pop()
++        self.cells = []
++        for number, line in enumerate(self.raw):
++            body = line.lstrip(" ")
++            self.cells.append([len(line) - len(body), body, number])
++        self.pos = 0
++
++    # -- cursor --
++    def peek(self):
++        while self.pos < len(self.cells):
++            indent, body, number = self.cells[self.pos]
++            if body == "" or body.startswith("#"):
++                self.pos += 1
++                continue
++            if body[:1] == "\t":
++                raise MiniYAMLError("tab characters cannot be used for indentation (line %d)"
++                                    % (number + 1))
++            return indent, body, number
++        return None
++
++    def _rewrite(self, number, indent, body):
++        self.cells[number] = [indent, body, number]
++
++    # -- document --
++    def parse_document(self):
++        head = self.peek()
++        if head is None:
++            return None
++        indent, body, number = head
++        if body.startswith("%"):
++            raise UnsupportedYAMLError("YAML directives are not supported (line %d)" % (number + 1))
++        if body == "---":
++            self.pos = number + 1
++            head = self.peek()
++            if head is None:
++                return None
++            indent, body, number = head
++        elif body.startswith("--- "):
++            self._rewrite(number, 4, _strip_comment(body[4:]).lstrip(" "))
++            indent, body, number = self.cells[number]
++        if body == "...":
++            return None
++        value = self._parse_block(indent)
++        self._check_trailing()
++        return value
++
++    def _check_trailing(self):
++        head = self.peek()
++        if head is None:
++            return
++        _indent, body, number = head
++        if body == "...":
++            self.pos = number + 1
++            if self.peek() is not None:
++                raise MiniYAMLError("unexpected content after '...' (line %d)"
++                                   % (self.peek()[2] + 1))
++            return
++        if body == "---" or body.startswith("--- "):
++            raise UnsupportedYAMLError("multi-document streams need yaml.safe_load_all; "
++                                       "the built-in fallback reads a single document (line %d)"
++                                       % (number + 1))
++        raise MiniYAMLError("unexpected top-level content (line %d): %s" % (number + 1, body[:60]))
++
++    # -- nodes --
++    def _parse_block(self, indent):
++        head = self.peek()
++        if head is None:
++            return None
++        line_indent, body, number = head
++        if line_indent < indent:
++            return None
++        if _is_seq_entry(body):
++            return self._parse_seq(line_indent)
++        if _split_key(body) is not None:
++            return self._parse_map(line_indent)
++        self.pos = number + 1
++        return self._parse_value(body, line_indent, number)
++
++    def _parse_seq(self, indent):
++        items = []
++        while True:
++            head = self.peek()
++            if head is None:
++                break
++            line_indent, body, number = head
++            if line_indent < indent:
++                break
++            if line_indent > indent:
++                raise MiniYAMLError("unexpected indentation in sequence (line %d)" % (number + 1))
++            if not _is_seq_entry(body):
++                break
++            tail = body[1:]
++            stripped = tail.lstrip(" ")
++            column = indent + 1 + (len(tail) - len(stripped))
++            if stripped == "" or stripped.startswith("#"):
++                self.pos = number + 1
++                items.append(self._parse_nested(indent))
++            else:
++                self._rewrite(number, column, stripped)
++                items.append(self._parse_block(column))
++            if self.pos <= number:
++                raise MiniYAMLError("could not make progress at line %d" % (number + 1))
++        return items
++
++    def _parse_map(self, indent):
++        mapping = {}
++        while True:
++            head = self.peek()
++            if head is None:
++                break
++            line_indent, body, number = head
++            if line_indent < indent:
++                break
++            if _is_seq_entry(body):
++                break
++            if line_indent > indent:
++                raise MiniYAMLError("unexpected indentation in mapping (line %d)" % (number + 1))
++            split = _split_key(body)
++            if split is None:
++                break
++            key_text, rest = split
++            if key_text[:1] in "&*!":
++                raise UnsupportedYAMLError("anchors and tags on keys are not supported (line %d)"
++                                           % (number + 1))
++            key = _parse_key_token(key_text, number)
++            self.pos = number + 1
++            if rest == "":
++                mapping[key] = self._parse_nested(indent)
++            else:
++                mapping[key] = self._parse_value(rest, line_indent, number)
++            if self.pos <= number:
++                raise MiniYAMLError("could not make progress at line %d" % (number + 1))
++        return mapping
++
++    def _parse_nested(self, indent):
++        """Value of a 'key:' / '-' line that continues on following lines."""
++        head = self.peek()
++        if head is None:
++            return None
++        deeper, body, _number = head
++        if deeper > indent:
++            return self._parse_block(deeper)
++        if deeper == indent and _is_seq_entry(body):
++            return self._parse_seq(indent)
++        return None
++
++    def _parse_value(self, text, line_indent, number):
++        text = text.strip()
++        if text == "":
++            return self._parse_nested(line_indent)
++        marker = text[0]
++        if marker in "&*":
++            raise UnsupportedYAMLError("anchors and aliases are not supported by the built-in "
++                                       "YAML fallback (line %d); install PyYAML" % (number + 1))
++        if marker == "!":
++            raise UnsupportedYAMLError("explicit tags are not supported by the built-in "
++                                       "YAML fallback (line %d); install PyYAML" % (number + 1))
++        if marker in "|>":
++            return self._parse_block_scalar(text, line_indent, number)
++        if marker in "[{":
++            return self._parse_flow(text, number)
++        if marker in "'\"":
++            return self._parse_multiline_quoted(text, number, line_indent)
++        return self._parse_plain(text, number, line_indent)
++
++    def _parse_flow(self, text, number):
++        buffer = text
++        while True:
++            depth, open_quote = _flow_state(buffer)
++            if depth <= 0 and open_quote is None:
++                break
++            head = self.peek()
++            if head is None:
++                raise MiniYAMLError("unterminated flow collection (line %d)" % (number + 1))
++            _indent, body, index = head
++            buffer += " " + body
++            self.pos = index + 1
++        depth, open_quote = _flow_state(buffer)
++        if depth < 0 or open_quote:
++            raise MiniYAMLError("unbalanced flow collection (line %d)" % (number + 1))
++        value, consumed = _flow_node(buffer, 0)
++        remainder = buffer[consumed:].strip()
++        if remainder and not remainder.startswith("#") and remainder not in ("]", "}"):
++            raise MiniYAMLError("unexpected trailing content after flow value (line %d)"
++                                % (number + 1))
++        return value
++
++    def _parse_multiline_quoted(self, text, number, line_indent):
++        buffer = text
++        while True:
++            end, closed = _scan_quoted(buffer, 0)
++            if closed:
++                tail = buffer[end + 1:].strip()
++                if tail and not tail.startswith("#"):
++                    raise MiniYAMLError("unexpected content after a quoted scalar (line %d): %s"
++                                        % (number + 1, tail[:40]))
++                return _unquote(buffer[:end + 1])
++            head = self.peek()
++            if head is None:
++                raise MiniYAMLError("unterminated quoted scalar (line %d)" % (number + 1))
++            _indent, body, index = head
++            joiner = "" if buffer.endswith("\\") else " "
++            buffer = buffer.rstrip() + joiner + body
++            self.pos = index + 1
++
++    def _parse_plain(self, text, number, line_indent):
++        value = _strip_comment(text)
++        if value == "":
++            return self._parse_nested(line_indent)
++        parts = [value]
++        while True:
++            head = self.peek()
++            if head is None:
++                break
++            deeper, body, index = head
++            if deeper <= line_indent:
++                break
++            if _is_seq_entry(body) or _split_key(body) is not None:
++                break
++            if body[0] in "|>[]{}&*!":
++                break
++            continued = _strip_comment(body)
++            if continued == "":
++                break
++            parts.append(continued)
++            self.pos = index + 1
++        if len(parts) == 1:
++            return _resolve_plain(value)
++        return " ".join(parts)
++
++    def _parse_block_scalar(self, header, line_indent, number):
++        style = header[0]
++        spec = _strip_comment(header[1:]).strip()
++        chomp = "clip"
++        explicit = None
++        for char in spec:
++            if char == "-":
++                chomp = "strip"
++            elif char == "+":
++                chomp = "keep"
++            elif char.isdigit():
++                explicit = int(char)
++            else:
++                raise MiniYAMLError("bad block scalar header %r (line %d)" % (header, number + 1))
++        base = None if explicit is None else line_indent + explicit
++        collected = []
++        index = number + 1
++        while index < len(self.raw):
++            line = self.raw[index]
++            if line.strip() == "":
++                collected.append("")
++                index += 1
++                continue
++            indent = len(line) - len(line.lstrip(" "))
++            if base is None:
++                if indent <= line_indent:
++                    break
++                base = indent
++            if indent < base:
++                if indent <= line_indent:
++                    break
++                raise MiniYAMLError("inconsistent indentation in block scalar (line %d)"
++                                    % (index + 1))
++            collected.append(line[base:])
++            index += 1
++        self.pos = index
++        content = list(collected)
++        trailing = 0
++        while content and content[-1] == "":
++            content.pop()
++            trailing += 1
++        return _block_body(style, content, chomp, trailing)
++
++
++def _block_body(style, content, chomp, trailing):
++    """Assemble a block scalar body, then apply the chomping indicator."""
++    if style == "|":
++        text = "\n".join(content)
++    else:
++        text = ""
++        started = False
++        breaks = 0
++        previous_literal = False
++        for line in content:
++            if line == "":
++                if started:
++                    breaks += 1
++                continue
++            literal = line[:1] in (" ", "\t")
++            if started:
++                if breaks:
++                    text += "\n" * breaks
++                elif literal or previous_literal:
++                    text += "\n"
++                else:
++                    text += " "
++            text += line
++            started = True
++            breaks = 0
++            previous_literal = literal
++    if not content or text == "":
++        return ""
++    if chomp == "strip":
++        return text
++    if chomp == "keep":
++        return text + "\n" * (1 + trailing)
++    return text + "\n"
++
++
++def _parse_key_token(text, number):
++    text = text.strip()
++    if text == "":
++        raise MiniYAMLError("empty mapping key (line %d)" % (number + 1))
++    if text[0] in "'\"":
++        _end, closed = _scan_quoted(text, 0)
++        if not closed:
++            raise MiniYAMLError("unterminated quoted key (line %d)" % (number + 1))
++        return _unquote(text)
++    if text[0] in "[{":
++        raise UnsupportedYAMLError("flow-style mapping keys are not supported by the "
++                                   "built-in YAML fallback (line %d)" % (number + 1))
++    if text == "<<":
++        raise UnsupportedYAMLError("merge keys ('<<') are not supported by the built-in "
++                                   "YAML fallback (line %d); install PyYAML" % (number + 1))
++    return _resolve_plain(text)
++
++
++# -- emitter -------------------------------------------------------------------
++_UNSAFE_START = "-?:,[]{}#&*!|>'\"%@`"
++
++
++def _is_plain_safe(text):
++    """True when ``text`` round-trips as a string with no quotes."""
++    if text == "" or text != text.strip():
++        return False
++    if not isinstance(_resolve_plain(text), str):
++        return False
++    head = text[0]
++    if head in _UNSAFE_START:
++        if not (head in "-?:" and len(text) > 1 and text[1] not in " \t"):
++            return False
++    if ": " in text or " #" in text or text.endswith(":"):
++        return False
++    for char in text:
++        if ord(char) < 0x20 or char == "\x7f":
++            return False
++    return True
++
++
++def _quote_single(text):
++    return "'" + text.replace("'", "''") + "'"
++
++
++def _quote_double(text, allow_unicode):
++    out = ['"']
++    for char in text:
++        code = ord(char)
++        if char == '"':
++            out.append('\\"')
++        elif char == "\\":
++            out.append("\\\\")
++        elif char == "\n":
++            out.append("\\n")
++        elif char == "\t":
++            out.append("\\t")
++        elif char == "\r":
++            out.append("\\r")
++        elif code < 0x20:
++            out.append("\\x%02x" % code)
++        elif code > 0x7E and not allow_unicode:
++            if code <= 0xFF:
++                out.append("\\x%02x" % code)
++            elif code <= 0xFFFF:
++                out.append("\\u%04x" % code)
++            else:
++                out.append("\\U%08x" % code)
++        else:
++            out.append(char)
++    out.append('"')
++    return "".join(out)
++
++
++def _string_scalar(text, allow_unicode):
++    if not allow_unicode and any(ord(char) > 0x7E for char in text):
++        return _quote_double(text, allow_unicode)
++    if _is_plain_safe(text):
++        return text
++    printable = all(ord(char) >= 0x20 for char in text)
++    if printable and (allow_unicode or all(ord(char) <= 0x7E for char in text)):
++        return _quote_single(text)
++    return _quote_double(text, allow_unicode)
++
++
++def _block_literal(text, allow_unicode):
++    """Return (header, lines) when ``text`` is safe to emit as a literal block."""
++    if "\n" not in text or "\r" in text or text[:1] in (" ", "\t"):
++        return None
++    if not allow_unicode and any(ord(char) > 0x7E for char in text):
++        return None
++    for line in text.split("\n"):
++        if line != line.rstrip(" \t") or line[:1] == "\t":
++            return None
++    trailing = len(text) - len(text.rstrip("\n"))
++    header = "|" if trailing == 1 else ("|+" if trailing >= 2 else "|-")
++    lines = text.split("\n")
++    if trailing:
++        lines = lines[:-trailing]
++    return header, lines
++
++
++def _scalar_repr(value, allow_unicode):
++    if value is None:
++        return "null"
++    if isinstance(value, bool):
++        return "true" if value else "false"
++    if isinstance(value, int):
++        return str(value)
++    if isinstance(value, float):
++        if math.isnan(value):
++            return ".nan"
++        if math.isinf(value):
++            return ".inf" if value > 0 else "-.inf"
++        return repr(value)
++    if isinstance(value, str):
++        return _string_scalar(value, allow_unicode)
++    if isinstance(value, datetime.datetime):
++        return value.isoformat(sep=" ")
++    if isinstance(value, datetime.date):
++        return value.isoformat()
++    raise RepresenterError("cannot represent an object of type %s with the built-in "
++                           "YAML fallback; install PyYAML" % type(value).__name__)
++
++
++def _sorted_items(mapping, sort_keys):
++    items = list(mapping.items())
++    if not sort_keys:
++        return items
++    try:
++        return sorted(items)
++    except TypeError:
++        return sorted(items, key=lambda pair: str(pair[0]))
++
++
++def _flow_repr(value, allow_unicode, sort_keys):
++    if isinstance(value, dict):
++        parts = []
++        for key, item in _sorted_items(value, sort_keys):
++            parts.append("%s: %s" % (_scalar_repr(key, allow_unicode),
++                                     _flow_repr(item, allow_unicode, sort_keys)))
++        return "{" + ", ".join(parts) + "}"
++    if isinstance(value, (list, tuple)):
++        return "[" + ", ".join(_flow_repr(item, allow_unicode, sort_keys) for item in value) + "]"
++    return _scalar_repr(value, allow_unicode)
++
++
++def _render_value(lines, head, col, value, allow_unicode, sort_keys, step):
++    """Append ``head`` plus its value to ``lines`` (mapping-entry style)."""
++    if isinstance(value, dict):
++        if not value:
++            lines.append(head + " {}")
++            return
++        lines.append(head)
++        lines.extend(_render_mapping(value, col + step, allow_unicode, sort_keys, step))
++        return
++    if isinstance(value, (list, tuple)):
++        if not value:
++            lines.append(head + " []")
++            return
++        lines.append(head)
++        lines.extend(_render_sequence(list(value), col, allow_unicode, sort_keys, step))
++        return
++    if isinstance(value, str):
++        block = _block_literal(value, allow_unicode)
++        if block is not None:
++            header, body = block
++            lines.append(head + " " + header)
++            lines.extend(_indented(body, col + step))
++            return
++    lines.append(head + " " + _scalar_repr(value, allow_unicode))
++
++
++def _indented(lines, col):
++    return ["" if line == "" else " " * col + line for line in lines]
++
++
++def _render_mapping(mapping, col, allow_unicode, sort_keys, step):
++    if not mapping:
++        return [" " * col + "{}"]
++    lines = []
++    for key, value in _sorted_items(mapping, sort_keys):
++        head = " " * col + _scalar_repr(key, allow_unicode) + ":"
++        _render_value(lines, head, col, value, allow_unicode, sort_keys, step)
++    return lines
++
++
++def _render_sequence(sequence, col, allow_unicode, sort_keys, step):
++    if not sequence:
++        return [" " * col + "[]"]
++    dash = " " * col + "- "
++    lines = []
++    for item in sequence:
++        if isinstance(item, dict) and item:
++            block = _render_mapping(item, col + 2, allow_unicode, sort_keys, step)
++            lines.append(dash + block[0].lstrip())
++            lines.extend(block[1:])
++        elif isinstance(item, (list, tuple)) and item:
++            block = _render_sequence(list(item), col + 2, allow_unicode, sort_keys, step)
++            lines.append(dash + block[0].lstrip())
++            lines.extend(block[1:])
++        elif isinstance(item, dict):
++            lines.append(dash + "{}")
++        elif isinstance(item, (list, tuple)):
++            lines.append(dash + "[]")
++        else:
++            block = _block_literal(item, allow_unicode) if isinstance(item, str) else None
++            if block is not None:
++                header, body = block
++                lines.append(" " * col + "- " + header)
++                lines.extend(_indented(body, col + max(step, 2)))
++            else:
++                lines.append(dash + _scalar_repr(item, allow_unicode))
++    return lines
++
++
++# -- public API ----------------------------------------------------------------
++YAMLError = MiniYAMLError
++MarkedYAMLError = MiniYAMLError
++
++
++def _read_stream(stream):
++    if stream is None:
++        return None
++    if isinstance(stream, str):
++        return stream
++    if isinstance(stream, bytes):
++        return stream.decode("utf-8")
++    reader = getattr(stream, "read", None)
++    if callable(reader):
++        data = reader()
++        if isinstance(data, bytes):
++            return data.decode("utf-8")
++        return data
++    raise MiniYAMLError("expected str, bytes or a file-like object, got %s"
++                       % type(stream).__name__)
++
++
++def safe_load(stream):
++    """Parse one YAML document into plain Python containers (YAML 1.1 rules)."""
++    text = _read_stream(stream)
++    if text is None:
++        return None
++    if text.startswith("\ufeff"):
++        text = text[1:]
++    return _Reader(text).parse_document()
++
++
++def load(stream, Loader=None):
++    """``yaml.load`` with no custom Loader: identical to safe_load for our purposes."""
++    if Loader is not None:
++        raise UnsupportedYAMLError("custom Loader classes are not supported by the "
++                                   "built-in YAML fallback")
++    return safe_load(stream)
++
++
++def safe_dump(data, stream=None, *, default_flow_style=False, allow_unicode=False,
++              sort_keys=True, indent=None, width=None):
++    """Emit plain Python containers as block YAML.
++
++    ``width`` is accepted for call-site parity and ignored: the fallback never folds
++    lines, and an unfolded line is still valid YAML that PyYAML reads back unchanged.
++    """
++    step = int(indent) if indent else 2
++    if isinstance(data, dict):
++        if not data:
++            text = "{}\n"
++        elif default_flow_style:
++            text = _flow_repr(data, allow_unicode, sort_keys) + "\n"
++        else:
++            text = "\n".join(_render_mapping(data, 0, allow_unicode, sort_keys, step)) + "\n"
++    elif isinstance(data, (list, tuple)):
++        items = list(data)
++        if not items:
++            text = "[]\n"
++        elif default_flow_style:
++            text = _flow_repr(items, allow_unicode, sort_keys) + "\n"
++        else:
++            text = "\n".join(_render_sequence(items, 0, allow_unicode, sort_keys, step)) + "\n"
++    else:
++        text = _scalar_repr(data, allow_unicode) + "\n"
++    if stream is None:
++        return text
++    stream.write(text)
++    return None
++
++
++def dump(data, stream=None, *, default_flow_style=False, allow_unicode=False,
++         sort_keys=True, indent=None, width=None):
++    """``yaml.dump``: the fallback has no tag machinery, so this is safe_dump."""
++    return safe_dump(data, stream, default_flow_style=default_flow_style,
++                     allow_unicode=allow_unicode, sort_keys=sort_keys,
++                     indent=indent, width=width)
++
++
++def safe_dump_all(documents, stream=None, **kwargs):
++    for index, document in enumerate(documents):
++        text = safe_dump(document, None, **kwargs)
++        chunk = ("--- " if index else "") + text
++        if stream is None:
++            yield chunk
++        else:
++            stream.write(chunk)
++    if stream is not None:
++        return None
+diff --git a/tests/test_yaml_mini_fallback.py b/tests/test_yaml_mini_fallback.py
+new file mode 100644
+index 0000000..37e76e2
+--- /dev/null
++++ b/tests/test_yaml_mini_fallback.py
+@@ -0,0 +1,291 @@
++﻿"""api.yaml_mini: the opt-in, dependency-free YAML backend for offline deployments.
++
++Runs with the standard library alone (pytest optional): ``python tests/test_yaml_mini_fallback.py``
++executes every test_ function and prints a summary.
++"""
++
++import datetime
++import io
++import os
++import sys
++from pathlib import Path
++
++try:
++    import pytest
++except ModuleNotFoundError:  # standalone run: python tests/test_yaml_mini_fallback.py
++    class _Skipped(Exception):
++        pass
++
++    class _RaisesCtx:
++        def __init__(self, expected):
++            self.expected = expected
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, exc_type, exc, tb):
++            if exc_type is None:
++                raise AssertionError("DID NOT RAISE %s" % getattr(self.expected, "__name__", self.expected))
++            if not issubclass(exc_type, self.expected):
++                return False
++            return True
++
++    class _PytestShim:
++        raises = staticmethod(_RaisesCtx)
++
++        @staticmethod
++        def skip(reason=""):
++            raise _Skipped(reason)
++
++    pytest = _PytestShim()
++    _Skipped = _Skipped  # noqa: N816
++else:
++    class _Skipped(Exception):
++        pass
++
++REPO = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO))
++
++from api import yaml_mini  # noqa: E402
++
++
++CFG = {
++    "model": {"default": "claude-opus", "provider": "anthropic"},
++    "toolsets": ["web", "terminal"],
++    "webui_chat_backend": "gateway",
++    "webui_gateway_use_runs_api": True,
++    "name": "café",
++    "count": 3,
++    "empty": None,
++}
++
++
++def test_round_trip_config_tree():
++    text = yaml_mini.safe_dump(CFG, sort_keys=False, allow_unicode=True)
++    assert yaml_mini.safe_load(text) == CFG
++    assert "café" in text
++
++
++def test_round_trip_accepts_stream_and_empty():
++    text = yaml_mini.safe_dump(CFG, allow_unicode=True)
++    assert yaml_mini.safe_load(io.StringIO(text)) == CFG
++    assert yaml_mini.safe_dump(CFG, io.StringIO(), allow_unicode=True) is None
++    assert yaml_mini.safe_load("") is None
++    assert yaml_mini.safe_load("# just a comment\n") is None
++
++
++def test_yaml11_implicit_typing_matches_pyyaml():
++    doc = ("tool_progress: off\nshow_reasoning: no\nstreaming: on\nauto: yes\n"
++           "quoted: 'off'\nbare_y: y\nbare_n: n\noctal: 010\nhex: 0x1F\n"
++           "sexagesimal: 1:30\nunderscored: 1_000\nsci: 1e3\nfloat: 1.5\n"
++           "inf: .inf\nnothing: ~\ntilde:\n")
++    assert yaml_mini.safe_load(doc) == {
++        "tool_progress": False, "show_reasoning": False, "streaming": True,
++        "auto": True, "quoted": "off", "bare_y": "y", "bare_n": "n",
++        "octal": 8, "hex": 31, "sexagesimal": 90, "underscored": 1000,
++        "sci": "1e3", "float": 1.5, "inf": float("inf"), "nothing": None, "tilde": None,
++    }
++
++
++def test_timestamps_become_date_objects():
++    loaded = yaml_mini.safe_load("day: 2026-01-01\nstamp: 2026-01-01 07:17:03\n")
++    assert loaded["day"] == datetime.date(2026, 1, 1)
++    assert loaded["stamp"] == datetime.datetime(2026, 1, 1, 7, 17, 3)
++
++
++def test_duplicate_keys_last_value_wins_like_pyyaml():
++    doc = "model: a\nmodel: b\ndisplay:\n  tool_progress: all\n  tool_progress: off\n"
++    assert yaml_mini.safe_load(doc) == {"model": "b", "display": {"tool_progress": False}}
++
++
++def test_sequence_under_key_at_same_indent_is_pyyaml_output_style():
++    doc = "custom_providers:\n- name: one\n  api_key: PROXY_MANAGED\n- name: two\n"
++    assert yaml_mini.safe_load(doc) == {
++        "custom_providers": [{"name": "one", "api_key": "PROXY_MANAGED"}, {"name": "two"}]
++    }
++    assert yaml_mini.safe_load(yaml_mini.safe_dump({"toolsets": ["web", "terminal"]},
++                                                   sort_keys=False)) == {"toolsets": ["web", "terminal"]}
++
++
++def test_block_scalars_literal_folded_and_chomping():
++    assert yaml_mini.safe_load("v: |\n  a\n  b\n") == {"v": "a\nb\n"}
++    assert yaml_mini.safe_load("v: |-\n  a\n  b\n") == {"v": "a\nb"}
++    assert yaml_mini.safe_load("v: |+\n  a\n\n") == {"v": "a\n\n"}
++    assert yaml_mini.safe_load("v: >\n  a\n  b\n") == {"v": "a b\n"}
++    assert yaml_mini.safe_load("v: >\n  a\n\n  b\n") == {"v": "a\nb\n"}
++    assert yaml_mini.safe_load("v: |\n  a\nnext: 1\n") == {"v": "a\n", "next": 1}
++
++
++def test_long_text_values_round_trip_as_block_literals():
++    cfg = {"system_prompt": "line one\nline two\n", "tail": "no newline"}
++    text = yaml_mini.safe_dump(cfg, sort_keys=False)
++    assert "system_prompt: |\n  line one\n  line two\n" in text
++    assert "tail: no newline" in text
++    assert yaml_mini.safe_load(text) == cfg
++
++
++def test_quoted_scalar_with_trailing_comment():
++    assert yaml_mini.safe_load('cron: "17 7 * * *"  # nightly, 07:17 UTC\n') == {"cron": "17 7 * * *"}
++    assert yaml_mini.safe_load("cron: 'every day'   # note\n") == {"cron": "every day"}
++
++
++def test_plain_scalar_folds_over_many_continuation_lines():
++    doc = ("name: x\ndescription: one\n  two\n  three\n  four: not-a-key? no\nmaintainer: y\n")
++    loaded = yaml_mini.safe_load("description: one\n  two\n  three\nmaintainer: y\n")
++    assert loaded == {"description": "one two three", "maintainer": "y"}
++    # a continuation line that itself looks like a key ends the fold (PyYAML errors;
++    # we stop the fold and let the mapping layer report the indentation problem)
++    assert doc.count("description") == 1
++
++
++def test_flow_collections_and_nested_styles():
++    doc = ("l: [1, two, 'three', 4.5]\nm: {a: 1, b: [2, 3], c: {d: e}}\n"
++           "empty_l: []\nempty_m: {}\nnested: [[1, 2], [3]]\n")
++    assert yaml_mini.safe_load(doc) == {
++        "l": [1, "two", "three", 4.5],
++        "m": {"a": 1, "b": [2, 3], "c": {"d": "e"}},
++        "empty_l": [], "empty_m": {}, "nested": [[1, 2], [3]],
++    }
++    assert yaml_mini.safe_load("m: {a: 1,\n    b: 2}\n") == {"m": {"a": 1, "b": 2}}
++
++
++def test_multiline_quoted_scalars_fold():
++    assert yaml_mini.safe_load('v: "one\n  two"\n') == {"v": "one two"}
++    assert yaml_mini.safe_load("v: 'it''s\n  fine'\n") == {"v": "it's fine"}
++
++
++def test_double_quoted_escapes():
++    doc = "v: " + chr(34) + r"a\tb\nc\xe9\x41z" + chr(34) + chr(10)
++    assert yaml_mini.safe_load(doc) == {'v': "a\tb\nc" + chr(0xE9) + "Az"}
++
++
++def test_dump_quotes_yaml11_ambiguous_strings():
++    words = {"tool_progress": "off", "reasoning": "no", "mode": "on", "flag": "yes", "n": "n"}
++    text = yaml_mini.safe_dump(words, sort_keys=False)
++    assert yaml_mini.safe_load(text) == words
++    for value in ("off", "no", "on", "yes"):
++        assert ("'%s'" % value) in text
++    # bare y/n stay plain, exactly like PyYAML's YAML 1.1 table
++    assert "n: n" in text
++
++
++def test_dump_sorts_by_default_and_keeps_order_when_asked():
++    data = {"b": 1, "a": {"z": 0, "y": 1}}
++    assert yaml_mini.safe_dump(data).splitlines()[0] == "a:"
++    assert yaml_mini.safe_dump(data, sort_keys=False).splitlines()[0] == "b: 1"
++
++
++def test_dump_escapes_non_ascii_when_allow_unicode_false():
++    text = yaml_mini.safe_dump({"name": "café"}, sort_keys=False)
++    assert "caf" in text and "é" not in text
++    assert yaml_mini.safe_load(text) == {"name": "café"}
++
++
++def test_unsupported_features_fail_loudly_instead_of_guessing():
++    for doc in ("b: &b {x: 1}\nm:\n  <<: *b\n",
++                "s: !!str 1\n",
++                "a: 1\n--- \nb: 2\n",
++                "%YAML 1.1\na: 1\n",
++                "? [a, b]\n: c\n"):
++        with pytest.raises(yaml_mini.MiniYAMLError):
++            yaml_mini.safe_load(doc)
++
++
++def test_anchors_and_aliases_raise_unsupported():
++    with pytest.raises(yaml_mini.UnsupportedYAMLError):
++        yaml_mini.safe_load("base: &b {x: 1}\nclone: *b\n")
++
++
++def test_rejects_tab_indentation_and_unbalanced_flow():
++    with pytest.raises(yaml_mini.MiniYAMLError):
++        yaml_mini.safe_load("a:\n\tb: 1\n")
++    with pytest.raises(yaml_mini.MiniYAMLError):
++        yaml_mini.safe_load("a: [1, 2\n")
++
++
++def test_representer_rejects_unsupported_types():
++    with pytest.raises(yaml_mini.RepresenterError):
++        yaml_mini.safe_dump({"x": {1, 2}})
++    with pytest.raises(yaml_mini.RepresenterError):
++        yaml_mini.safe_dump({"x": b"bytes"})
++
++
++def test_corpus_of_real_yaml_files_round_trips():
++    import os
++
++    paths = []
++    roots = [REPO / "api", REPO / ".github"]
++    # The sibling hermes-agent checkout, wherever this pair is unzipped:
++    #   <base>/hermes-webui/<repo>/  +  <base>/hermes-agent/<version>/
++    for candidate in (REPO.parents[1] / "hermes-agent", REPO.parent / "hermes-agent"):
++        if candidate.is_dir():
++            roots.append(candidate)
++            break
++    for root in roots:
++        if not root.exists():
++            continue
++        for dirpath, dirnames, filenames in os.walk(root):
++            dirnames[:] = [d for d in dirnames if d not in ("node_modules", ".git", "venv", "__pycache__")]
++            for name in filenames:
++                if name.endswith((".yaml", ".yml")):
++                    paths.append(Path(dirpath) / name)
++    if not paths:
++        pytest.skip("no YAML corpus available")
++    parsed = unsupported = 0
++    for path in paths:
++        text = path.read_text(encoding="utf-8", errors="replace")
++        try:
++            data = yaml_mini.safe_load(text)
++        except yaml_mini.UnsupportedYAMLError as error:
++            unsupported += 1
++            assert "anchors and aliases are not supported" in str(error), path
++            continue
++        parsed += 1
++        assert yaml_mini.safe_load(yaml_mini.safe_dump(data, sort_keys=False,
++                                                      allow_unicode=True)) == data, path
++    assert parsed >= 50, parsed
++
++
++def test_compat_gates_the_fallback_behind_an_env_flag(monkeypatch):
++    for name in ("yaml", "ruamel", "ruamel.yaml", "api.yaml_compat", "api.yaml_mini"):
++        monkeypatch.delitem(sys.modules, name, raising=False)
++    monkeypatch.delenv("HERMES_WEBUI_YAML_MINI", raising=False)
++    monkeypatch.setenv("PATH", "")  # nothing to import: neither backend exists
++    with pytest.raises(ImportError):
++        importlib_import_compat()
++    monkeypatch.setenv("HERMES_WEBUI_YAML_MINI", "1")
++    module = importlib_import_compat()
++    assert module.BACKEND == "mini"
++    assert module.safe_load("a: 1") == {"a": 1}
++
++
++def importlib_import_compat():
++    import importlib
++
++    sys.path.insert(0, str(REPO))
++    return importlib.import_module("api.yaml_compat")
++
++
++def run_tests():
++    failures = []
++    skipped = []
++    for name in sorted(globals()):
++        if not name.startswith("test_") or name == "run_tests":
++            continue
++        func = globals()[name]
++        if name == "test_compat_gates_the_fallback_behind_an_env_flag":
++            continue  # needs a pytest monkeypatch fixture
++        try:
++            func()
++        except _Skipped as exc:
++            skipped.append("%s: %s" % (name, exc))
++        except Exception as exc:  # noqa: BLE001 - the point of the runner
++            failures.append("%s: %s: %s" % (name, type(exc).__name__, str(exc)[:200]))
++    print("yaml_mini tests: %d failed, %d skipped" % (len(failures), len(skipped)))
++    for line in failures:
++        print("  FAIL " + line)
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(run_tests())
