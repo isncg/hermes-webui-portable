@@ -1,0 +1,39 @@
+diff --git a/static/style.css b/static/style.css
+--- a/static/style.css
++++ b/static/style.css
+@@ -7624,3 +7624,35 @@
+ /* Settings field highlight (mirrors msg-question-highlight / _highlightQuestionRow pattern) */
+ .settings-field-highlight { animation: settings-field-pulse 1.6s ease-out; }
+ @keyframes settings-field-pulse { 0% { box-shadow: 0 0 0 0 var(--focus-ring); } 35% { box-shadow: 0 0 0 4px var(--focus-ring); } 100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); } }
++
++/* 桌面端：对话区与输入框使用同一套宽度规则 */
++@media (min-width: 641px) {
++  :root {
++    --msg-max: clamp(780px, 60vw, 1100px) !important;
++  }
++
++  .composer-box {
++    max-width: var(--msg-max) !important;
++  }
++
++  .messages-inner {
++    /* 对齐输入框外侧的左右 20px 留白 */
++    width: calc(100% - 40px) !important;
++    max-width: var(--msg-max) !important;
++    padding-left: 0 !important;
++    padding-right: 0 !important;
++    min-width: 0;
++  }
++
++  /* 长用户消息也允许展开，解除原来的 60% 限制 */
++  .msg-row[data-role='user'] {
++    max-width: 100% !important;
++  }
++}
++
++/* 与现有输入框的大屏规则保持一致 */
++@media (min-width: 1600px) {
++  :root {
++    --msg-max: 1600px !important;
++  }
++}
