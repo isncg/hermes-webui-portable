@@ -74,7 +74,7 @@ echo [setup] validating the offline YAML fallback
 "%PYTHON_EXE%" "%WEBUI%\tests\test_yaml_mini_fallback.py" "%WEBUI%" || goto command_failed
 
 echo.
-echo [setup] ready. Start with: .\start-hermes-webui.cmd
+echo [setup] ready. Start with: .\start.cmd
 exit /b 0
 
 :ensure_uv

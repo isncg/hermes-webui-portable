@@ -64,21 +64,31 @@ setup.cmd -GatewayOnly
 
 ## 启动
 
-前台入口：
+后台启动（推荐）：
 
 ```bat
-start-hermes-webui.cmd
+start.cmd
 ```
 
-后台管理入口：
+服务器在后台运行。重复执行 `start.cmd` 时会检测已有实例并直接跳过。启动成功后会使用 Chrome 应用窗口打开 <http://localhost:8787/>；未安装到默认路径时只提示地址。双击运行时窗口会在显示结果后等待按键再关闭；在脚本中调用时可设置 `HERMES_START_NO_PAUSE=1` 跳过等待。停止后台服务器：
 
 ```bat
-run-webui.cmd -Background
+stop.cmd
+```
+
+前台运行（日志直接输出到当前终端，按 Ctrl-C 停止）：
+
+```bat
+server.cmd
+```
+
+查看后台状态、健康检查和最近的日志：
+
+```bat
 run-webui.cmd -Status
-run-webui.cmd -Stop
 ```
 
-可用 `-Port 8787` 和 `-BindHost 127.0.0.1` 临时覆盖监听地址。默认打开 <http://127.0.0.1:8787>。Provider、模型和密钥继续从 `%USERPROFILE%\.hermes` 读取；会话默认写入 `%USERPROFILE%\.hermes\webui`；文件工作区位于仓库顶层 `workspace`。
+`run-webui.cmd` 是底层管理入口，也接受 `-Start`、`-Stop` 和 `-Foreground`。`start.cmd` 与 `server.cmd` 支持用 `-Port 8787` 和 `-BindHost 127.0.0.1` 临时覆盖监听地址。默认打开 <http://127.0.0.1:8787>。Provider、模型和密钥继续从 `%USERPROFILE%\.hermes` 读取；会话默认写入 `%USERPROFILE%\.hermes\webui`；文件工作区位于仓库顶层 `workspace`。
 
 ## 配置
 
@@ -117,7 +127,7 @@ run-webui.cmd -Stop
 
 ## 安全边界
 
-所有 Windows 入口和安装脚本均为 `.cmd`，不调用或依赖 PowerShell。Python 和 `uv` 均安装在仓库内部；后台进程管理使用项目私有 Python 的标准库和 Windows 自带的 `taskkill.exe`。
+所有 Windows 入口和安装脚本均为 `.cmd`，不调用或依赖 PowerShell。Python 和 `uv` 均安装在仓库内部；后台进程管理使用项目私有 Python 的标准库和 Windows 自带的 `taskkill.exe`，如果 `taskkill.exe` 被安全策略拦截，则回退到 Win32 `TerminateProcess`。
 
 补丁和启动脚本不使用命令混淆、重命名或编码拼接来规避安全检查。
 
