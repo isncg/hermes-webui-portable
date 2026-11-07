@@ -30,7 +30,7 @@ ERR_LOG = VAR / "webui.err.log"
 def usage(exit_code: int = 0) -> None:
     print(
         "Usage: run-webui.cmd [-Start | -Foreground | -Status | -Stop] "
-        "[-Port number] [-BindHost address]"
+        "[-Port number] [-BindHost address] [-RequirePassword]"
     )
     raise SystemExit(exit_code)
 
@@ -41,6 +41,7 @@ def parse_args(arguments: list[str]) -> dict[str, object]:
         "foreground": False,
         "stop": False,
         "status": False,
+        "require_password": False,
         "port": None,
         "bind_host": None,
     }
@@ -60,6 +61,10 @@ def parse_args(arguments: list[str]) -> dict[str, object]:
             continue
         if normalized in {"stop", "status"}:
             options[normalized] = True
+            index += 1
+            continue
+        if normalized in {"requirepassword", "require-password"}:
+            options["require_password"] = True
             index += 1
             continue
         if normalized in {"port", "bindhost"}:
@@ -214,7 +219,7 @@ def wait_until_stopped(process_id: int, timeout: float = 3.0) -> bool:
     return not process_is_running(process_id)
 
 
-def read_pid_record() -> tuple[int, str | None] | None:
+def read_pid_record() -> dict[str, object] | None:
     try:
         raw = PID_FILE.read_text(encoding="utf-8").strip()
     except (FileNotFoundError, UnicodeDecodeError):
@@ -224,10 +229,11 @@ def read_pid_record() -> tuple[int, str | None] | None:
     try:
         if raw.startswith("{"):
             record = json.loads(raw)
-            process_id = int(record["pid"])
-            image = record.get("image")
-            return process_id, str(image) if image else None
-        return int(raw), None
+            if not isinstance(record, dict):
+                return None
+            int(record["pid"])
+            return record
+        return {"pid": int(raw)}
     except (ValueError, TypeError, KeyError):
         return None
 
@@ -236,13 +242,15 @@ def recorded_process_id() -> int | None:
     record = read_pid_record()
     if record is None:
         return None
-    process_id, recorded_image = record
+    process_id = int(record["pid"])
     if not process_is_running(process_id):
         return None
     image = process_image_path(process_id)
     if image is None:
         return process_id
+    recorded_image = record.get("image")
     if recorded_image:
+        recorded_image = str(recorded_image)
         try:
             same_image = Path(image).resolve() == Path(recorded_image).resolve()
         except OSError:
@@ -250,6 +258,33 @@ def recorded_process_id() -> int | None:
         return process_id if same_image else None
     image_name = Path(image).name.lower()
     return process_id if image_name in {"python.exe", "pythonw.exe"} else None
+
+
+def recorded_bind() -> tuple[str, str] | None:
+    record = read_pid_record()
+    if record is None:
+        return None
+    host = record.get("host")
+    port = record.get("port")
+    if host is None or port is None:
+        return None
+    return str(host), str(port)
+
+
+def bind_scope(host: str) -> str:
+    value = host.strip().lower()
+    if value in {"", "*", "0.0.0.0", "::", "[::]"}:
+        return "all-interfaces"
+    if value in {"127.0.0.1", "localhost", "::1", "[::1]"}:
+        return "loopback"
+    return value
+
+
+def same_bind(existing: tuple[str, str], requested: tuple[str, str]) -> bool:
+    return (
+        bind_scope(existing[0]) == bind_scope(requested[0])
+        and existing[1] == requested[1]
+    )
 
 
 def probe_host(host: str) -> str:
@@ -263,6 +298,37 @@ def probe_host(host: str) -> str:
     if ":" in host and not host.startswith("["):
         return f"[{host}]"
     return host
+
+
+def local_ipv4_addresses() -> list[str]:
+    try:
+        entries = socket.getaddrinfo(
+            socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM
+        )
+    except OSError:
+        return []
+    addresses = {
+        entry[4][0] for entry in entries if not entry[4][0].startswith("127.")
+    }
+    return sorted(addresses)
+
+
+def print_access_urls() -> None:
+    host = os.environ["HERMES_WEBUI_HOST"]
+    port = os.environ["HERMES_WEBUI_PORT"]
+    if bind_scope(host) == "all-interfaces":
+        print(f"[portable] local: http://127.0.0.1:{port}/")
+        addresses = local_ipv4_addresses()
+        if addresses:
+            for address in addresses:
+                print(f"[portable] lan  : http://{address}:{port}/")
+        else:
+            print(
+                "[portable] lan  : use this computer's IPv4 address "
+                f"with port {port}"
+            )
+        return
+    print(f"[portable] url: http://{probe_host(host)}:{port}/")
 
 
 def probe_health(timeout: float = 2.0) -> tuple[bool, str | None]:
@@ -327,8 +393,9 @@ def tail(path: Path, line_count: int = 20) -> None:
         return
     print(f"--- {path.name} ---")
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    encoding = sys.stdout.encoding or "utf-8"
     for line in lines[-line_count:]:
-        print(line)
+        print(line.encode(encoding, errors="replace").decode(encoding))
 
 
 def show_status() -> None:
@@ -350,6 +417,8 @@ def show_status() -> None:
         print(f"[portable] health: unavailable ({health})")
     else:
         print("[portable] health: unavailable")
+    if healthy:
+        print_access_urls()
 
     tail(OUT_LOG)
     tail(ERR_LOG)
@@ -368,31 +437,63 @@ def validate_runtime() -> None:
     )
 
 
+def require_lan_password() -> None:
+    if os.environ.get("HERMES_WEBUI_PASSWORD", "").strip():
+        return
+    import getpass
+
+    try:
+        password = getpass.getpass("[portable] LAN password: ")
+    except (KeyboardInterrupt, EOFError):
+        raise RuntimeError("LAN password entry cancelled.") from None
+    if password.strip():
+        os.environ["HERMES_WEBUI_PASSWORD"] = password
+        print("[portable] password set for this run.")
+        return
+    raise RuntimeError(
+        "LAN mode requires a non-empty password."
+    )
+
+
 def start_background() -> None:
+    host = os.environ["HERMES_WEBUI_HOST"]
+    port = os.environ["HERMES_WEBUI_PORT"]
     process_id = recorded_process_id()
     if process_id is not None:
+        existing_bind = recorded_bind()
+        if existing_bind is None and bind_scope(host) == "all-interfaces":
+            raise RuntimeError(
+                "a background instance is already running but its listening "
+                "address is unknown. Run stop.cmd, then start-lan.cmd again."
+            )
+        if existing_bind is not None and not same_bind(
+            existing_bind, (host, port)
+        ):
+            raise RuntimeError(
+                "a background instance is already running on "
+                f"{existing_bind[0]}:{existing_bind[1]}. Run stop.cmd before "
+                f"switching to {host}:{port}."
+            )
         print(
             f"[portable] already running: PID {process_id}; start skipped."
         )
-        print(
-            "[portable] url: "
-            f"http://{os.environ['HERMES_WEBUI_HOST']}:{os.environ['HERMES_WEBUI_PORT']}"
-        )
+        print_access_urls()
         return
     PID_FILE.unlink(missing_ok=True)
 
     healthy, health = probe_health()
     if healthy:
+        if bind_scope(host) == "all-interfaces":
+            raise RuntimeError(
+                "a server is already running on this port but was not started "
+                "by start.cmd. Stop it before using LAN mode."
+            )
         print(f"[portable] server is already running (health: {health}); start skipped.")
-        print(
-            "[portable] url: "
-            f"http://{os.environ['HERMES_WEBUI_HOST']}:{os.environ['HERMES_WEBUI_PORT']}"
-        )
+        print_access_urls()
         return
     if port_is_open():
         raise RuntimeError(
-            "port "
-            f"{os.environ['HERMES_WEBUI_HOST']}:{os.environ['HERMES_WEBUI_PORT']} "
+            f"port {host}:{port} "
             "is already in use by another program. Stop it or pass -Port."
         )
 
@@ -410,13 +511,17 @@ def start_background() -> None:
         )
     image = process_image_path(process.pid) or str(PYTHON)
     PID_FILE.write_text(
-        json.dumps({"pid": process.pid, "image": image}), encoding="utf-8"
+        json.dumps(
+            {
+                "pid": process.pid,
+                "image": image,
+                "host": host,
+                "port": port,
+            }
+        ),
+        encoding="utf-8",
     )
     state = wait_for_startup(process)
-    url = (
-        f"http://{os.environ['HERMES_WEBUI_HOST']}:"
-        f"{os.environ['HERMES_WEBUI_PORT']}"
-    )
     if state == "exited":
         PID_FILE.unlink(missing_ok=True)
         print(
@@ -432,7 +537,7 @@ def start_background() -> None:
         print("[portable] health: up")
     else:
         print("[portable] health: not ready yet (still starting)")
-    print(f"[portable] url: {url}")
+    print_access_urls()
     print("[portable] use stop.cmd to stop it.")
 
 
@@ -449,10 +554,7 @@ def wait_for_startup(process: subprocess.Popen[bytes], timeout: float = 10.0) ->
 
 
 def run_foreground() -> int:
-    print(
-        "[portable] url: "
-        f"http://{os.environ['HERMES_WEBUI_HOST']}:{os.environ['HERMES_WEBUI_PORT']}"
-    )
+    print_access_urls()
     print("[portable] Ctrl-C stops the server.")
     try:
         return subprocess.call(
@@ -473,8 +575,9 @@ def main() -> int:
     if options["status"]:
         show_status()
         return 0
-
     validate_runtime()
+    if options["require_password"]:
+        require_lan_password()
     if options["background"]:
         start_background()
         return 0
