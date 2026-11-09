@@ -1,0 +1,171 @@
+diff --git a/agent/process_bootstrap.py b/agent/process_bootstrap.py
+index 0e58dc852c..0007ccc21a 100644
+--- a/agent/process_bootstrap.py
++++ b/agent/process_bootstrap.py
+@@ -16,7 +16,12 @@ from typing import Any, Optional
+ 
+ from hermes_bootstrap import _happy_eyeballs_create_connection
+ from utils import base_url_hostname, normalize_proxy_url
+-from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy
++from agent.proxy_bypass import (
++    first_proxy_env_value,
++    is_loopback_host,
++    should_bypass_proxy,
++    split_host_port,
++)
+ 
+ 
+ _OPENAI_CLS_CACHE = None
+@@ -173,14 +178,146 @@ def _get_proxy_from_env() -> Optional[str]:
+     return normalize_proxy_url(value) if value else None
+ 
+ 
+-def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
+-    """Env-configured proxy unless NO_PROXY excludes this base URL (same matcher as the
+-    gateway adapters: CIDR, ``*.`` wildcards and host:port entries all count)."""
++_WIN_PROXY_CACHE: "tuple[float, Optional[str], Optional[frozenset[str]]] | None" = None
++_WIN_PROXY_CACHE_TTL = 30.0
++
++
++def _cidr_is_valid(cidr: str) -> bool:
++    """True when ``ip_network(cidr, strict=False)`` parses (guard for registry junk)."""
++    try:
++        import ipaddress
++
++        ipaddress.ip_network(cidr, strict=False)
++        return True
++    except ValueError:
++        return False
++
++
++def _windows_system_proxy() -> "tuple[Optional[str], Optional[frozenset[str]]]":
++    """(proxy_url, bypass_hosts) from the Windows per-user system proxy registry, or (None, None).
++
++    Returns (None, None) quickly when off Windows, when the system proxy is disabled, or when
++    anything unexpected happens (registry read included) — a system-proxy fallback must never
++    break env-configured operation. Never cached across ``ProxyEnable`` toggles for longer than
++    ``_WIN_PROXY_CACHE_TTL`` seconds so turning Clash on/off is picked up promptly.
++    """
++    global _WIN_PROXY_CACHE
++    import time as _time
++
++    if sys.platform != "win32":
++        return None, None
++    now = _time.monotonic()
++    if _WIN_PROXY_CACHE is not None:
++        stamped_at, cached_proxy, cached_bypass = _WIN_PROXY_CACHE
++        if now - stamped_at < _WIN_PROXY_CACHE_TTL:
++            return cached_proxy, cached_bypass
++
++    proxy: Optional[str] = None
++    bypass: Optional[frozenset[str]] = None
++    try:
++        import winreg
++
++        with winreg.OpenKey(
++            winreg.HKEY_CURRENT_USER,
++            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
++        ) as key:
++            try:
++                enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
++            except OSError:
++                enabled = 0
++            if not enabled:
++                proxy, bypass = None, frozenset()
++            else:
++                server, _ = winreg.QueryValueEx(key, "ProxyServer")
++                raw_server = str(server or "").strip()
++                # 'host:port' means one proxy for every scheme; 'http=h:p;https=h2:p2' is
++                # scheme-split (WinINET dialect) — take the https entry first, then http.
++                if "=" in raw_server:
++                    by_scheme: dict[str, str] = {}
++                    for part in raw_server.split(";"):
++                        scheme, _, value = part.strip().partition("=")
++                        if scheme and value:
++                            by_scheme[scheme.strip().lower()] = value.strip()
++                    chosen = by_scheme.get("https") or by_scheme.get("http") or ""
++                else:
++                    chosen = raw_server
++                if chosen:
++                    proxy = normalize_proxy_url(
++                        chosen if "://" in chosen else f"http://{chosen}"
++                    )
++                try:
++                    override, _ = winreg.QueryValueEx(key, "ProxyOverride")
++                except OSError:
++                    override = ""
++                # WinINET uses '<local>' for plain-hostname (no dot) bypass; those can't be
++                # an LLM API host, so they only matter as extra NO_PROXY-style entries.
++                # WinINET also allows bare-IP-prefix wildcards ('10.*', '192.168.1.*') that
++                # no_proxy_entry_matches does not understand — rewrite those as CIDRs so
++                # the shared matcher gives them the WinINET meaning.
++                entries: list[str] = []
++                for part in str(override or "").split(";"):
++                    token = part.strip()
++                    lowered = token.lower()
++                    if not token or lowered == "<local>":
++                        continue
++                    if lowered.endswith(".*") or lowered == "*":
++                        base = lowered[:-2] if lowered.endswith(".*") else ""
++                        octet_parts = base.split(".") if base else []
++                        if not octet_parts or all(p.isdigit() and 0 <= int(p) <= 255 for p in octet_parts):
++                            # '*' alone is handled by no_proxy_entry_matches; '10.*' ==
++                            # 10.0.0.0/8, '192.168.*' == 192.168.0.0/16.
++                            cidr = f"{'.'.join(octet_parts + ['0'] * (4 - len(octet_parts)))}/{8 * len(octet_parts)}"
++                            if cidr == "0.0.0.0/0":
++                                entries.append("*")
++                            elif _cidr_is_valid(cidr):
++                                entries.append(cidr)
++                            continue
++                    entries.append(token)
++                bypass = frozenset(entry.lower() for entry in entries)
++    except Exception:
++        proxy, bypass = None, None
++    _WIN_PROXY_CACHE = (now, proxy, bypass)
++    return proxy, bypass
++
++
++def _proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
++    """Resolve the proxy for ``base_url``: env wins, else the Windows system proxy.
++
++    Env-configured proxies keep the existing behaviour exactly (NO_PROXY matcher decides).
++    Only when no ``*_PROXY`` env var is set does the Windows per-user system proxy
++    (Clash & co. write ProxyEnable/ProxyServer) become a fallback — the OpenAI SDK/httpx
++    stack otherwise ignores it, so direct connections to blocked hosts time out. Loopback
++    targets (local proxy channels on 127.0.0.1) and ``ProxyOverride`` entries always dial
++    direct.
++    """
+     proxy = _get_proxy_from_env()
+-    if not (proxy and base_url):
++    if proxy:
++        raw = (base_url or "").strip()
++        if raw and should_bypass_proxy(raw if "://" in raw else f"//{raw}"):
++            return None
+         return proxy
+-    raw = base_url.strip()
+-    return None if should_bypass_proxy(raw if "://" in raw else f"//{raw}") else proxy
++
++    target = (base_url or "").strip()
++    if not target:
++        return None
++    parsed_target = target if "://" in target else f"//{target}"
++    if is_loopback_host(split_host_port(parsed_target)[0]):
++        return None
++    system_proxy, bypass = _windows_system_proxy()
++    if not system_proxy:
++        return None
++    if bypass is None:
++        return None
++    if should_bypass_proxy(parsed_target, no_proxy_value=",".join(sorted(bypass)) or None):
++        return None
++    return system_proxy or None
++
++
++def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
++    """Env-configured proxy unless NO_PROXY excludes this base URL (same matcher as the
++    gateway adapters: CIDR, ``*.`` wildcards and host:port entries all count); falls back
++    to the Windows per-user system proxy when no proxy env vars are configured."""
++    return _proxy_for_base_url(base_url)
+ 
+ 
+ def _shared_transport_cls():
