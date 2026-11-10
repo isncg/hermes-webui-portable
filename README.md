@@ -112,15 +112,44 @@ run-webui.cmd -Status
 
 ## 补丁模型
 
-当前 WebUI 补丁提供 opt-in 的纯标准库 YAML fallback，供完全离线、无法安装 PyYAML/ruamel.yaml 的环境使用。正常安装时优先级仍是 `PyYAML > ruamel.yaml > yaml_mini`。
-
-补丁由 `scripts/apply-patches.cmd` 按文件名顺序应用：
+本仓库只通过 `patches/<组件>/NNNN-*.patch` 保存对上游源码的适配。`scripts/apply-patches.cmd` 按组件内文件名顺序幂等应用补丁：
 
 - 可正向应用：执行 `git apply`。
 - 可反向检查：视为已经应用。
 - 两者都失败：立即停止，要求升级时人工 rebase 补丁。
 
 应用补丁后 submodule 显示 dirty 是预期行为。不要在 submodule 中提交本地适配；应更新 `patches` 中的补丁。
+
+### Hermes WebUI
+
+- `patches/hermes-webui/0001-offline-yaml-mini.patch`
+  - 目的：让完全离线、无法安装 PyYAML/ruamel.yaml 的主机仍能启动 WebUI。缺少 YAML 后端时 `import server` 会在 `api/profiles.py` 阶段失败。
+  - 改动：新增纯标准库的 `api/yaml_mini.py`，在 `api/yaml_compat.py` 中增加可选的 `mini` 后端；支持 PyYAML 风格的 YAML 1.1 隐式类型、块/流集合、块/引号标量、注释和单文档标记。
+  - 启用条件：同时满足 `HERMES_WEBUI_YAML_MINI` 为真值，且 PyYAML 与 ruamel.yaml 都无法导入。正常安装时后端优先级仍是 `PyYAML > ruamel.yaml > yaml_mini`；未设置该变量时保持上游的 `ImportError` 行为。
+  - 失败策略：锚点/别名、合并键、标签、显式键、指令和多文档流会抛出 `UnsupportedYAMLError`，不会静默猜解析结果，避免后续保存时截断用户配置。
+  - 验证：`tests/test_yaml_mini_fallback.py`，`setup.cmd` 安装后会运行该回归测试。
+- `patches/hermes-webui/0002-desktop-message-width.patch`
+  - 目的：桌面端让对话区与输入框使用同一套宽度，并解除用户长消息原有的 60% 宽度限制。
+  - 改动：仅修改 `static/style.css`。`>=641px` 时 `--msg-max` 为 `clamp(780px, 60vw, 1100px)`，`>=1600px` 时为 `1600px`；同时调整 `.composer-box`、`.messages-inner` 和 `.msg-row[data-role='user']`。
+  - 注意：纯展示层改动，使用 `!important` 覆盖已有布局规则，不涉及后端行为；升级后需做一次桌面宽度视觉检查。
+- `patches/hermes-webui/0003-windows-workspace-blocked-roots.patch`
+  - 目的：修复 Windows 上合法的 `D:\dev\...` 项目被误判为系统目录的问题。POSIX 名称在 Windows 上是驱动器相对路径，旧规则把 `/dev` 解析成当前盘的 `\dev`。
+  - 改动：`api/workspace.py` 在 Windows 上改用 `%SystemRoot%`、`%WINDIR%`、`%ProgramFiles%`、`%ProgramFiles(x86)%`、`%ProgramW6432%` 和 `%ProgramData%` 作为禁止根目录；POSIX 根目录和 `/private/...` 只保留在 POSIX 平台。远程终端的 POSIX 形态路径仍会被拒绝。
+  - 验证：新增 `tests/test_workspace_blocked_roots_windows.py`，并让原 POSIX 测试在 Windows 上跳过；当前 Windows 用例 23 项通过。
+
+### Hermes Agent
+
+- `patches/hermes-agent/0001-dual-stack-oauth-callback.patch`
+  - 目的：修复 Windows 上浏览器把 `localhost` 解析为 `::1`、而登录回调只监听 `127.0.0.1` 时无法完成授权的问题；同时避免两个登录进程通过 `SO_REUSEADDR` 共用 1455 端口后，旧监听器截获回调。
+  - 改动：`hermes_cli/auth_device_flow.py` 在同一端口同时绑定 IPv4 与 IPv6 回环地址，IPv6 使用 `IPV6_V6ONLY`；Windows 使用 `SO_EXCLUSIVEADDRUSE` 且不再设置 `SO_REUSEADDR`；IPv6 绑定失败且 `localhost` 不解析到 IPv6 时退回仅 IPv4。`hermes_cli/auth_codex_browser.py` 补充端口占用和浏览器连接失败提示。
+  - 注意：1455 端口已被占用时仍会回退到设备码登录。
+  - 验证：`tests/hermes_cli/test_auth_codex_browser_login.py` 和 `tests/hermes_cli/test_browser_connect_dual_stack.py`。
+- `patches/hermes-agent/0002-windows-system-proxy-fallback.patch`
+  - 目的：Clash 等工具通常只写 Windows 用户级系统代理，OpenAI SDK/httpx 不会自动读取；仅配置系统代理时直连被墙主机会超时。
+  - 改动：`agent/process_bootstrap.py` 在没有任何 `*_PROXY` 环境变量时读取注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` 的 `ProxyEnable`、`ProxyServer` 和 `ProxyOverride`；支持 `host:port` 与 `http=...;https=...` 两种格式，把 WinINET 的 `10.*` 形式转换为 CIDR，结果缓存 30 秒；回环地址和 `ProxyOverride` 条目始终直连。
+  - 注意：环境变量代理保持原有优先权和 `NO_PROXY` 匹配行为；注册表读取失败会静默关闭该兜底，不影响原有配置。`<local>` 被忽略，只影响无点主机名，不会影响 LLM API 主机。当前没有针对注册表兜底的独立自动化测试，现有环境变量代理测试通过。
+
+两个组件的补丁分别按文件名顺序应用，当前补丁之间没有顺序依赖。新增补丁时沿用四位序号前缀，并在本节补充目的、启用条件、失败行为和验证方式。
 
 ## 升级
 

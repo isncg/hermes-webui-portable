@@ -1,0 +1,216 @@
+diff --git a/api/workspace.py b/api/workspace.py
+index 511aa9f1d..9af058a1b 100644
+--- a/api/workspace.py
++++ b/api/workspace.py
+@@ -744,6 +744,49 @@ _USER_TMP_PREFIXES: tuple[Path, ...] = (
+ )
+ 
+ 
++_POSIX_BLOCKED_ROOTS: tuple[str, ...] = (
++    # Linux / macOS
++    '/etc',
++    '/usr',
++    '/var',
++    '/bin',
++    '/sbin',
++    '/boot',
++    '/proc',
++    '/sys',
++    '/dev',
++    '/lib',
++    '/lib64',
++    '/opt/homebrew',
++    '/System',
++    '/Library',
++)
++
++
++def _windows_blocked_roots() -> tuple[str, ...]:
++    """Native Windows system directories that must never be workspaces.
++
++    POSIX root names are *drive-relative* on Windows: ``Path('/dev')`` is
++    ``\\dev`` and ``.resolve()`` anchors it to the current drive, so the old
++    ``/dev`` entry rejected legitimate projects such as ``D:\\dev\\my-repo``
++    with "Path points to a system directory".  Windows therefore needs its
++    own blocklist of real system directories instead of the POSIX names.
++    """
++    raw: list[str] = []
++    for env_name in (
++        'SystemRoot',
++        'WINDIR',
++        'ProgramFiles',
++        'ProgramFiles(x86)',
++        'ProgramW6432',
++        'ProgramData',
++    ):
++        value = os.environ.get(env_name)
++        if value and value not in raw:
++            raw.append(value)
++    return tuple(raw)
++
++
+ def _workspace_blocked_roots() -> tuple[Path, ...]:
+     """System roots that must never be accepted as workspace candidates.
+ 
+@@ -759,23 +802,7 @@ def _workspace_blocked_roots() -> tuple[Path, ...]:
+     (e.g. ``/var/folders/.../T/`` on macOS) are handled by
+     :func:`_is_blocked_system_path`, not by exclusion from this list.
+     """
+-    _raw = (
+-        # Linux / macOS
+-        '/etc',
+-        '/usr',
+-        '/var',
+-        '/bin',
+-        '/sbin',
+-        '/boot',
+-        '/proc',
+-        '/sys',
+-        '/dev',
+-        '/lib',
+-        '/lib64',
+-        '/opt/homebrew',
+-        '/System',
+-        '/Library',
+-    )
++    _raw = _windows_blocked_roots() if os.name == 'nt' else _POSIX_BLOCKED_ROOTS
+     _seen: set[Path] = set()
+     _out: list[Path] = []
+     for _p in _raw:
+@@ -843,7 +870,9 @@ def _is_blocked_system_path(candidate: Path) -> bool:
+ 
+ 
+ def _workspace_blocked_resolved_subtrees() -> tuple[Path, ...]:
+-    roots = list(_workspace_blocked_roots()) + [Path('/private/etc')]
++    roots = list(_workspace_blocked_roots())
++    if os.name != 'nt':
++        roots.append(Path('/private/etc'))
+     resolved: list[Path] = []
+     for root in roots:
+         try:
+@@ -856,7 +885,9 @@ def _workspace_blocked_resolved_subtrees() -> tuple[Path, ...]:
+ 
+ 
+ def _workspace_blocked_exact_roots() -> tuple[Path, ...]:
+-    roots = [Path('/'), Path('/private/var')]
++    roots = [Path('/')]
++    if os.name != 'nt':
++        roots.append(Path('/private/var'))
+     for root in _workspace_blocked_roots():
+         try:
+             roots.append(root.expanduser().resolve())
+diff --git a/tests/test_workspace_blocked_roots_macos.py b/tests/test_workspace_blocked_roots_macos.py
+index dfa7726dd..f00a2f275 100644
+--- a/tests/test_workspace_blocked_roots_macos.py
++++ b/tests/test_workspace_blocked_roots_macos.py
+@@ -30,8 +30,18 @@ from api.workspace import (
+ 
+ 
+ _IS_MACOS = sys.platform == 'darwin'
++_IS_WINDOWS = sys.platform == 'win32'
+ _macos_only = pytest.mark.skipif(not _IS_MACOS, reason="macOS-specific symlink layout")
+ 
++# POSIX root names are drive-relative on Windows (Path('/dev') resolves to
++# <current drive>:\dev), so this whole blocked-roots contract only applies
++# to POSIX hosts. Windows coverage lives in
++# tests/test_workspace_blocked_roots_windows.py.
++pytestmark = pytest.mark.skipif(
++    _IS_WINDOWS,
++    reason="POSIX blocked roots do not exist on Windows",
++)
++
+ 
+ # ── Blocked-roots set includes both literal and resolved forms ──────────────
+ 
+diff --git a/tests/test_workspace_blocked_roots_windows.py b/tests/test_workspace_blocked_roots_windows.py
+new file mode 100644
+index 000000000..5640f25a0
+--- /dev/null
++++ b/tests/test_workspace_blocked_roots_windows.py
+@@ -0,0 +1,86 @@
++"""Regression tests for the Windows workspace blocked-roots check.
++
++POSIX root names are drive-relative on Windows: ``Path('/dev')`` is
++``\\dev`` and ``Path('/dev').resolve()`` becomes ``<current drive>:\\dev``.
++The historical POSIX blocklist therefore rejected any legitimate project
++stored under a top-level ``dev`` folder (for example
++``D:\\dev\\hermes-webui-portable-dev``) with
++"Path points to a system directory".
++
++The blocklist is now platform-specific: Windows blocks its native system
++directories (``%SystemRoot%``, ``%ProgramFiles%``, ``%ProgramData%`` ...)
++instead of the POSIX names, while POSIX-shaped remote-terminal paths are
++still rejected by the string-shape check.
++"""
++import os
++import sys
++from pathlib import Path
++
++import pytest
++
++from api.workspace import (
++    _is_blocked_system_path,
++    _is_blocked_workspace_path,
++    _workspace_blocked_roots,
++)
++
++pytestmark = pytest.mark.skipif(
++    sys.platform != 'win32',
++    reason="Windows-specific drive semantics",
++)
++
++
++def _current_drive_root() -> Path:
++    return Path(Path.cwd().anchor)
++
++
++class TestPosixNamesAreNotDriveRoots:
++    """``/dev`` must not be reinterpreted as ``<current drive>:\\dev``."""
++
++    @pytest.mark.parametrize(
++        "name",
++        ["dev", "etc", "usr", "var", "bin", "sbin", "boot", "proc", "sys", "lib", "lib64"],
++    )
++    def test_project_under_posix_named_top_level_dir_allowed(self, name):
++        candidate = _current_drive_root() / name / "my-project"
++        assert not _is_blocked_system_path(candidate)
++        assert not _is_blocked_workspace_path(candidate, str(candidate))
++
++    def test_dev_project_regression(self):
++        candidate = _current_drive_root() / "dev" / "hermes-webui-portable-dev"
++        assert not _is_blocked_workspace_path(candidate, str(candidate))
++
++    def test_blocked_roots_contain_no_resolved_posix_roots(self):
++        roots = _workspace_blocked_roots()
++        for posix_root in ("/dev", "/etc", "/usr", "/var", "/bin", "/lib", "/System", "/Library"):
++            assert Path(posix_root) not in roots
++            assert Path(posix_root).resolve() not in roots
++
++
++class TestNativeWindowsSystemDirsBlocked:
++    @pytest.mark.parametrize("env_name", ["SystemRoot", "ProgramFiles", "ProgramData"])
++    def test_env_system_dir_blocked(self, env_name):
++        value = os.environ.get(env_name)
++        if not value:
++            pytest.skip(f"{env_name} is not set")
++        root = Path(value)
++        assert _is_blocked_system_path(root)
++        assert _is_blocked_system_path(root / "subdir")
++        assert _is_blocked_workspace_path(root, str(root))
++
++    def test_windows_dir_subpath_blocked(self):
++        system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
++        if not system_root:
++            pytest.skip("SystemRoot is not set")
++        assert _is_blocked_system_path(Path(system_root) / "System32" / "drivers")
++
++
++class TestRemotePosixPathsStillBlocked:
++    """Remote terminal profiles may target a POSIX host from a Windows UI."""
++
++    @pytest.mark.parametrize(
++        "remote",
++        ["/etc", "/etc/ssh", "/dev/sda", "/usr/local/bin", "/bin/sh", "/Library/Fonts"],
++    )
++    def test_posix_shape_rejected(self, remote):
++        assert _is_blocked_workspace_path(Path(remote), remote)
