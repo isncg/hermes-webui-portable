@@ -1,0 +1,525 @@
+diff --git a/api/models.py b/api/models.py
+index d6c888a4b..561d185f0 100644
+--- a/api/models.py
++++ b/api/models.py
+@@ -15139,6 +15139,112 @@ def _merge_session_messages_append_only_impl(
+     return merged_messages
+ 
+ 
++def _clarify_tool_response_answers(message):
++    """Return the user answer(s) embedded in a persisted clarify tool result.
++
++    The clarify tool returns a JSON payload such as
++    ``{"question": "...", "choices_offered": ["A", "B"], "user_response": "A"}``
++    (or ``{"responses": [...]}`` for a batch). The WebUI keeps tool rows in the
++    transcript for model replay but never renders them, so without a projected
++    user row the chosen option is lost from the visible chat and from reloads.
++    """
++    if not isinstance(message, dict) or message.get("role") != "tool":
++        return []
++    tool_name = str(message.get("name") or message.get("tool_name") or "").strip().lower()
++    if tool_name and tool_name != "clarify":
++        return []
++    content = message.get("content")
++    raw = ""
++    if isinstance(content, str):
++        raw = content.strip()
++    elif isinstance(content, list):
++        parts = []
++        for part in content:
++            if isinstance(part, str):
++                parts.append(part)
++            elif isinstance(part, dict):
++                text = part.get("text")
++                if not isinstance(text, str):
++                    text = part.get("content")
++                if isinstance(text, str):
++                    parts.append(text)
++        raw = "".join(parts).strip()
++    elif isinstance(content, dict):
++        raw = json.dumps(content, ensure_ascii=False)
++    if not raw:
++        return []
++    try:
++        payload = json.loads(raw)
++    except (TypeError, ValueError):
++        return []
++    entries = []
++    if isinstance(payload, dict):
++        responses = payload.get("responses")
++        if isinstance(responses, list):
++            entries = [entry for entry in responses if isinstance(entry, dict)]
++        elif "user_response" in payload:
++            entries = [payload]
++    answers = []
++    for entry in entries:
++        value = entry.get("user_response")
++        if isinstance(value, list):
++            value = ", ".join(str(item).strip() for item in value if str(item).strip())
++        answer = str(value or "").strip()
++        if answer:
++            answers.append(answer)
++    return answers
++
++
++def inject_clarify_response_display_rows(messages):
++    """Project clarify tool answers as user rows in the visible transcript.
++
++    A WebUI-only synthetic row is inserted immediately after each clarify tool
++    result so the chosen option appears at the point it was made and survives a
++    reload. The row is display-only: model-facing sanitizers drop
++    ``_clarify_response`` rows because the clarify tool result already carries
++    the answer. Re-running the projection is idempotent.
++    """
++    rows = list(messages or [])
++    if not rows:
++        return rows
++    projected = []
++    for index, message in enumerate(rows):
++        projected.append(message)
++        answers = _clarify_tool_response_answers(message)
++        if not answers:
++            continue
++        # The live UI echoes one bubble per answered question (a batch is asked
++        # one card at a time), so one synthetic row per answer keeps reloads
++        # matching what the user saw.
++        following = []
++        cursor = index + 1
++        while cursor < len(rows):
++            candidate = rows[cursor]
++            if (
++                isinstance(candidate, dict)
++                and candidate.get("role") == "user"
++                and candidate.get("_clarify_response") is True
++            ):
++                following.append(str(candidate.get("content") or "").strip())
++                cursor += 1
++                continue
++            break
++        if following == answers:
++            continue
++        pending = answers[len(following):] if following and answers[:len(following)] == following else answers
++        timestamp = message.get("timestamp", message.get("_ts"))
++        for answer in pending:
++            row = {
++                "role": "user",
++                "content": answer,
++                "_clarify_response": True,
++            }
++            if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
++                row["timestamp"] = timestamp
++            projected.append(row)
++    return projected
++
++
+ @overload
+ def reconciled_state_db_messages_for_session(
+     session,
+diff --git a/api/routes.py b/api/routes.py
+index a280f09d9..50e1f5679 100644
+--- a/api/routes.py
++++ b/api/routes.py
+@@ -6568,9 +6568,11 @@ def _resolve_share_session_pair(sid: str, handler):
+             raise KeyError(sid)
+         stored_session = _ensure_full_session_before_mutation(sid, stored_session)
+         snapshot_session = copy.copy(stored_session)
+-        snapshot_session.messages = _share_snapshot_messages_for_session(
+-            stored_session,
+-            cli_meta=cli_meta,
++        snapshot_session.messages = inject_clarify_response_display_rows(
++            _share_snapshot_messages_for_session(
++                stored_session,
++                cli_meta=cli_meta,
++            )
+         )
+         return snapshot_session, stored_session, cli_meta or {}
+     except KeyError:
+@@ -12196,6 +12198,7 @@ from api.models import (
+     get_state_db_session_summary,
+     merge_session_messages_append_only,
+     reconciled_state_db_messages_for_session,
++    inject_clarify_response_display_rows,
+     _cancelled_journal_turn_owner,
+     _reindex_tool_owners_after_message_reorder,
+     _project_native_image_payload_conflicts_for_display,
+@@ -15489,6 +15492,7 @@ def _handle_session_get(handler, parsed) -> bool:
+                     _display_owner_positions.update(_display_projected_owner_positions(
+                         sidecar_messages, _all_msgs, lineage_owners,
+                     ))
++            _all_msgs = inject_clarify_response_display_rows(_all_msgs)
+         else:
+             if is_messaging_session and cli_messages:
+                 _all_msgs = _merged_session_messages_for_display(s, cli_messages)
+@@ -18145,11 +18149,14 @@ def handle_post(handler, parsed) -> bool:
+                 session_id=getattr(copied_session, "session_id", None),
+             )
+ 
++            _visible_copy_messages = inject_clarify_response_display_rows(
++                list(copied_session.messages or [])
++            )
+             return j(
+                 handler,
+                 {
+                     "session": public_session_projection(
+-                        copied_session.compact() | {"messages": copied_session.messages}
++                        copied_session.compact() | {"messages": _visible_copy_messages}
+                     )
+                 },
+             )
+@@ -19220,10 +19227,19 @@ def handle_post(handler, parsed) -> bool:
+                 source_context = reconciled_state_db_messages_for_session(
+                     source, prefer_context=True, state_messages=source_state,
+                 )
++        # Keep the fork coordinate space identical to GET /api/session, where
++        # clarify answers are projected as visible user rows. The projection is
++        # display-only, so the forked transcript itself drops the synthetic rows
++        # and re-derives them from the clarify tool result on every read.
++        source_messages = inject_clarify_response_display_rows(source_messages)
+         if keep_count is not None:
+             forked_messages = source_messages[:keep_count]
+         else:
+             forked_messages = list(source_messages)
++        forked_messages = [
++            message for message in forked_messages
++            if not (isinstance(message, dict) and message.get("_clarify_response") is True)
++        ]
+ 
+         # Derive title
+         if custom_title:
+@@ -28621,7 +28637,11 @@ def _handle_session_compression_recovery_start(handler, body):
+             profile=getattr(copied_session, "profile", None),
+             session_id=getattr(copied_session, "session_id", None),
+         )
+-    session_payload = redact_session_data(copied_session.compact() | {"messages": copied_session.messages})
++    session_payload = redact_session_data(copied_session.compact() | {
++        "messages": inject_clarify_response_display_rows(
++            list(copied_session.messages or [])
++        )
++    })
+     return j(
+         handler,
+         {
+diff --git a/api/streaming.py b/api/streaming.py
+index 84b8e280d..51444d31d 100644
+--- a/api/streaming.py
++++ b/api/streaming.py
+@@ -96,6 +96,7 @@ from api.models import (
+     _evict_sessions_over_cap,
+     clear_process_wakeup_pause,
+     get_state_db_session_messages,
++    inject_clarify_response_display_rows,
+     record_process_wakeup_provider_unavailable_pause,
+     reconciled_state_db_messages_for_session,
+ )
+@@ -207,6 +208,15 @@ def _session_payload_with_full_messages(session, *, tool_calls=None):
+             raw.pop('regeneration_revision', None)
+     except Exception:
+         raw.pop('regeneration_revision', None)
++    # Project clarify tool answers as visible user rows for the browser. This
++    # runs only on the serialized display payload: ``session.messages`` and the
++    # model-facing context stay free of synthetic rows, and regeneration /
++    # undo / retry still see the original turn structure.
++    visible_messages = inject_clarify_response_display_rows(
++        list(raw.get('messages') or [])
++    )
++    raw['messages'] = visible_messages
++    raw['message_count'] = len(visible_messages)
+     return raw
+ 
+ 
+@@ -7977,6 +7987,9 @@ def _sanitize_messages_for_api(
+     messages = [message for message in messages if not (
+         isinstance(message, dict) and message.get('_recovered_display_only') is True
+     )]
++    messages = [message for message in messages if not (
++        isinstance(message, dict) and message.get('_clarify_response') is True
++    )]
+     valid_tool_call_ids: set = set()
+     for msg in messages:
+         if not isinstance(msg, dict):
+diff --git a/static/messages.js b/static/messages.js
+index 11855e183..094cd5c4f 100644
+--- a/static/messages.js
++++ b/static/messages.js
+@@ -9818,6 +9818,49 @@ function showClarifyCard(pending) {
+   if (typeof syncTopbar === 'function') syncTopbar();
+ }
+ 
++function _clarifyChoiceEchoBodyHtml(text) {
++  const value = String(text || '');
++  if (typeof _getCachedRender === 'function') {
++    try { return _getCachedRender(value, true); } catch (_err) {}
++  }
++  if (typeof esc === 'function') {
++    return esc(value).replace(/\n/g, '<br>');
++  }
++  const holder = document.createElement('div');
++  holder.textContent = value;
++  return holder.innerHTML.replace(/\n/g, '<br>');
++}
++
++function _appendClarifyChoiceEcho(text) {
++  const value = String(text || '').trim();
++  if (!value) return null;
++  const inner = $('msgInner');
++  if (!inner) return null;
++  const row = document.createElement('div');
++  row.className = 'msg-row clarify-choice-row';
++  row.dataset.role = 'user';
++  row.dataset.clarifyResponse = '1';
++  row.dataset.rawText = value;
++  row.innerHTML = `<div class="msg-body">${_clarifyChoiceEchoBodyHtml(value)}</div>`;
++  // Place the echo at the END of the live turn's block stack so later
++  // post-clarify assistant segments append BELOW it. Rendering it through
++  // S.messages + renderMessages() put the row before the preserved live turn,
++  // i.e. above the model text that preceded the question.
++  const turn = $('liveAssistantTurn');
++  const blocks = (turn && typeof _assistantTurnBlocks === 'function')
++    ? _assistantTurnBlocks(turn)
++    : null;
++  if (blocks) blocks.appendChild(row);
++  else inner.appendChild(row);
++  try {
++    const messagesEl = $('messages');
++    const nearBottom = !messagesEl
++      || (messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight) <= 120;
++    if (nearBottom && typeof scrollToBottom === 'function') scrollToBottom();
++  } catch (_err) {}
++  return row;
++}
++
+ async function respondClarify(response) {
+   const sid = _clarifySessionId || (S.session && S.session.session_id);
+   if (!sid) return;
+@@ -9847,15 +9890,11 @@ async function respondClarify(response) {
+         _clarifyId = null;
+         _clearClarifyPendingForSession(sid);
+         hideClarifyCard(true, 'sent');
+-        // Echo the user's clarify choice as a visible message in the conversation
++        // Echo the choice immediately at the live-turn tail. The durable row is
++        // projected server-side from the clarify tool result, so this transient
++        // DOM row is replaced by the canonical transcript on settle/reload.
+         if (S.session && S.session.session_id === sid) {
+-          S.messages.push({
+-            role: 'user',
+-            content: value,
+-            _clarify_response: true,
+-            _ts: Date.now() / 1000,
+-          });
+-          if (typeof renderMessages === 'function') renderMessages({preserveScroll: true});
++          _appendClarifyChoiceEcho(value);
+         }
+       }
+     } else {
+diff --git a/static/ui.js b/static/ui.js
+index 6cb52ce41..9fa4eacc5 100644
+--- a/static/ui.js
++++ b/static/ui.js
+@@ -20596,7 +20596,7 @@ function renderMessages(options){
+   if(preWindowInsertion.taskOwnerNode) preservedCompressionTaskOwnerNode=preWindowInsertion.taskOwnerNode;
+   let lastUserRawIdx=-1;
+   for(let i=visWithIdx.length-1;i>=0;i--){
+-    if(visWithIdx[i].m&&visWithIdx[i].m.role==='user'){
++    if(visWithIdx[i].m&&visWithIdx[i].m.role==='user'&&!visWithIdx[i].m._clarify_response){
+       lastUserRawIdx=visWithIdx[i].rawIdx;
+       break;
+     }
+@@ -20881,7 +20881,7 @@ function renderMessages(options){
+     const recoveryHtml=recoveryPayload ? _compressionRecoveryHtml(recoveryPayload, (S.session&&S.session.session_id)||'') : '';
+     if(recoveryHtml) bodyHtml += recoveryHtml;
+     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
+-    const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
++    const isEditableUser=isUser&&!m._clarify_response&&rawIdx===lastUserRawIdx;
+     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
+     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
+     const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
+diff --git a/tests/test_clarify_choice_display_row.py b/tests/test_clarify_choice_display_row.py
+new file mode 100644
+index 000000000..b43f9757d
+--- /dev/null
++++ b/tests/test_clarify_choice_display_row.py
+@@ -0,0 +1,184 @@
++"""Clarify answers as visible user rows in the WebUI transcript.
++
++Covers the projection helper (tool result JSON -> display-only user row), the
++SSE/GET display boundaries that must inject it, and the guarantees that keep the
++persisted transcript and model-facing context free of synthetic rows.
++"""
++
++import json
++import os
++import sys
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++if str(REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(REPO_ROOT))
++os.environ.setdefault(
++    "HERMES_WEBUI_DEFAULT_WORKSPACE",
++    str(REPO_ROOT.parent / "workspace"),
++)
++
++from api.models import (  # noqa: E402
++    _clarify_tool_response_answers,
++    inject_clarify_response_display_rows,
++)
++
++SINGLE_RESULT = json.dumps(
++    {
++        "question": "Which environment?",
++        "choices_offered": ["staging", "prod"],
++        "user_response": "staging",
++    },
++    ensure_ascii=False,
++)
++
++BATCH_RESULT = json.dumps(
++    {
++        "responses": [
++            {"question": "Q1", "choices_offered": ["a", "b"], "user_response": "a"},
++            {"question": "Q2", "choices_offered": ["c", "d"], "user_response": ["c", "d"]},
++        ]
++    },
++    ensure_ascii=False,
++)
++
++
++def _tool(content, name="clarify", **extra):
++    message = {"role": "tool", "name": name, "content": content}
++    message.update(extra)
++    return message
++
++
++def test_single_response_row_lands_after_tool_result():
++    tool = _tool(SINGLE_RESULT, timestamp=1700000000)
++    rows = inject_clarify_response_display_rows([tool])
++    assert len(rows) == 2
++    assert rows[0] is tool
++    assert rows[1]["role"] == "user"
++    assert rows[1]["content"] == "staging"
++    assert rows[1]["_clarify_response"] is True
++    assert rows[1]["timestamp"] == 1700000000
++
++
++def test_batch_responses_project_in_order_and_join_multi_select():
++    rows = inject_clarify_response_display_rows([_tool(BATCH_RESULT)])
++    assert [row.get("content") for row in rows[1:]] == ["a", "c, d"]
++    assert all(row.get("_clarify_response") is True for row in rows[1:])
++
++
++def test_structured_content_parts_are_parsed():
++    tool = _tool([{"type": "text", "text": SINGLE_RESULT}])
++    assert _clarify_tool_response_answers(tool) == ["staging"]
++
++
++def test_blank_or_missing_answer_projects_nothing():
++    assert inject_clarify_response_display_rows(
++        [_tool(json.dumps({"question": "q", "user_response": ""}))]
++    ) == [_tool(json.dumps({"question": "q", "user_response": ""}))]
++    assert _clarify_tool_response_answers(_tool(json.dumps({"question": "q"}))) == []
++    assert _clarify_tool_response_answers(_tool(json.dumps({"responses": []}))) == []
++
++
++def test_malformed_and_non_clarify_tools_project_nothing():
++    malformed = _tool("{not json")
++    assert _clarify_tool_response_answers(malformed) == []
++    other = _tool(SINGLE_RESULT, name="bash")
++    assert _clarify_tool_response_answers(other) == []
++    assert inject_clarify_response_display_rows([malformed, other]) == [malformed, other]
++
++
++def test_projection_is_idempotent():
++    once = inject_clarify_response_display_rows([_tool(SINGLE_RESULT)])
++    twice = inject_clarify_response_display_rows(once)
++    assert twice == once
++    assert sum(1 for row in twice if row.get("_clarify_response")) == 1
++
++
++def test_projection_keeps_surrounding_turns_in_order():
++    rows = [
++        {"role": "user", "content": "deploy please"},
++        {"role": "assistant", "content": "Which environment?"},
++        _tool(SINGLE_RESULT),
++        {"role": "assistant", "content": "Deploying to staging."},
++    ]
++    projected = inject_clarify_response_display_rows(rows)
++    assert [row.get("role") for row in projected] == [
++        "user",
++        "assistant",
++        "tool",
++        "user",
++        "assistant",
++    ]
++    assert projected[3]["content"] == "staging"
++
++
++def test_merge_helper_does_not_persist_synthetic_rows():
++    from api.streaming import _merge_display_messages_after_agent_result
++
++    previous = [
++        {"role": "user", "content": "deploy please"},
++        {"role": "assistant", "content": "Which environment?"},
++        _tool(SINGLE_RESULT),
++    ]
++    merged = _merge_display_messages_after_agent_result(previous, previous, [], "deploy please")
++    assert not any(row.get("_clarify_response") for row in merged)
++
++
++def test_api_sanitizer_drops_display_row_but_keeps_tool_result():
++    from api.streaming import _sanitize_messages_for_api
++
++    tool = _tool(SINGLE_RESULT)
++    messages = [
++        {"role": "user", "content": "deploy please"},
++        {"role": "assistant", "content": "Which environment?"},
++        tool,
++        {"role": "user", "content": "staging", "_clarify_response": True},
++    ]
++    sanitized = _sanitize_messages_for_api(messages)
++    assert not any(row.get("_clarify_response") for row in sanitized)
++    assert any(row.get("role") == "tool" for row in sanitized)
++
++
++def test_session_payload_injects_display_row_without_touching_session_messages():
++    from api.streaming import _session_payload_with_full_messages
++
++    class _FakeSession:
++        session_id = "clarify-display-test"
++
++        def __init__(self):
++            self.tool_calls = []
++            self.truncation_watermark = None
++            self.truncation_boundary = None
++            self.messages = [
++                {"role": "user", "content": "deploy please"},
++                {"role": "assistant", "content": "Which environment?"},
++                _tool(SINGLE_RESULT),
++                {"role": "assistant", "content": "Deploying to staging."},
++            ]
++
++        def compact(self):
++            return {"session_id": self.session_id}
++
++    session = _FakeSession()
++    payload = _session_payload_with_full_messages(session)
++    payload_messages = payload["messages"]
++    assert any(row.get("_clarify_response") for row in payload_messages)
++    assert payload["message_count"] == len(payload_messages)
++    assert not any(row.get("_clarify_response") for row in session.messages)
++
++
++def test_display_boundaries_call_the_projection():
++    routes_src = (REPO_ROOT / "api" / "routes.py").read_text(encoding="utf-8")
++    assert "_all_msgs = inject_clarify_response_display_rows(_all_msgs)" in routes_src
++    assert "source_messages = inject_clarify_response_display_rows(source_messages)" in routes_src
++    streaming_src = (REPO_ROOT / "api" / "streaming.py").read_text(encoding="utf-8")
++    assert "visible_messages = inject_clarify_response_display_rows(" in streaming_src
++
++
++def test_client_echoes_choice_after_live_turn_blocks():
++    messages_src = (REPO_ROOT / "static" / "messages.js").read_text(encoding="utf-8")
++    respond_idx = messages_src.index("async function respondClarify")
++    respond_body = messages_src[respond_idx: respond_idx + 3000]
++    assert "S.messages.push" not in respond_body
++    assert "_appendClarifyChoiceEcho(value)" in respond_body
++    assert "blocks.appendChild(row)" in messages_src

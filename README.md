@@ -137,6 +137,12 @@ run-webui.cmd -Status
   - 改动：`api/workspace.py` 在 Windows 上改用 `%SystemRoot%`、`%WINDIR%`、`%ProgramFiles%`、`%ProgramFiles(x86)%`、`%ProgramW6432%` 和 `%ProgramData%` 作为禁止根目录；POSIX 根目录和 `/private/...` 只保留在 POSIX 平台。远程终端的 POSIX 形态路径仍会被拒绝。
   - 验证：新增 `tests/test_workspace_blocked_roots_windows.py`，并让原 POSIX 测试在 Windows 上跳过；当前 Windows 用例 23 项通过。
 
+- `patches/hermes-webui/0004-clarify-choice-display.patch`
+  - 目的：修复 clarify 选项交互的两个问题——点击选项后的回显被插到对话文字之前；退出会话再重新打开后，回显从消息列表消失。
+  - 改动：`api/models.py` 增加 clarify tool 结果解析与展示投影（支持单题、批题、多选，重复投影幂等）；`api/streaming.py` 在 SSE done 等展示 payload 出口注入回显行，并在模型请求清洗阶段剔除该行；`api/routes.py` 在 `GET /api/session`、fork、share、duplicate、compression-recovery 的展示出口统一投影；`static/messages.js` 点击选项后把回显追加到 live assistant turn 块栈末尾，不再改写 `S.messages` 后整屏重渲染；`static/ui.js` 避免把回显行当成可编辑的最后一条用户消息。
+  - 说明：回显行是展示层合成行（`_clarify_response`），不写入 `session.messages`/sidecar，也不进入模型上下文；每次加载都从 clarify tool 结果重新投影，因此刷新或切换会话后位置不变且不会重复。
+  - 验证：新增 `tests/test_clarify_choice_display_row.py`，覆盖解析、批题多选、幂等、展示出口注入、模型请求清洗和客户端回显位置。
+
 ### Hermes Agent
 
 - `patches/hermes-agent/0001-dual-stack-oauth-callback.patch`
